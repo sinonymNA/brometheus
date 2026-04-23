@@ -10,7 +10,7 @@ import statistics
 import traceback
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -747,8 +747,8 @@ class _BacktestRequest(BaseModel):
     symbols: list[str] = ["SPY", "QQQ", "AAPL"]
     strategies: list[str] = ["momentum", "iv_rank", "flow"]
     walk_forward: bool = False
-    test_start_date: date | None = None
-    test_end_date: date | None = None
+    test_start_date: Optional[date] = None
+    test_end_date: Optional[date] = None
 
 
 @app.post("/api/backtest", tags=["backtest"])
