@@ -281,7 +281,7 @@ async def _price_and_save(
     Args:
         symbol: Underlying ticker.
         spot: Mid-price of the underlying at the time of the cycle.
-        contracts: OCC-symbol → ``OptionSnapshot`` mapping, pre-filtered
+        contracts: OCC-symbol → ``OptionsSnapshot`` mapping, pre-filtered
             to the desired expiries.
 
     Returns:
@@ -505,7 +505,7 @@ def _nearest_n_expiries(chain: dict[str, Any], n: int) -> frozenset[date]:
     """Collect all unique expiry dates from *chain* and return the *n* nearest.
 
     Args:
-        chain: OCC-symbol → ``OptionSnapshot`` mapping.
+        chain: OCC-symbol → ``OptionsSnapshot`` mapping.
         n: Maximum number of expiry dates to return.
 
     Returns:

@@ -20,7 +20,7 @@ from typing import Any
 from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.models import Bar, OptionSnapshot, Quote
+from alpaca.data.models import Bar, OptionsSnapshot, Quote
 from alpaca.data.requests import (
     OptionChainRequest,
     StockBarsRequest,
@@ -219,7 +219,7 @@ class AlpacaClient:
         expiry_end: date | None = None,
         strike_min: float | None = None,
         strike_max: float | None = None,
-    ) -> dict[str, OptionSnapshot]:
+    ) -> dict[str, OptionsSnapshot]:
         """Fetch the options chain snapshot for an underlying equity.
 
         All filter parameters are optional — omitting them returns the full
@@ -235,7 +235,7 @@ class AlpacaClient:
 
         Returns:
             Dict mapping each OCC option symbol to its
-            :class:`~alpaca.data.models.OptionSnapshot` (bid/ask, greeks, IV).
+            :class:`~alpaca.data.models.OptionsSnapshot` (bid/ask, greeks, IV).
 
         Note:
             Options data requires an Alpaca Options subscription tier.
@@ -247,7 +247,7 @@ class AlpacaClient:
             strike_price_gte=strike_min,
             strike_price_lte=strike_max,
         )
-        result: dict[str, OptionSnapshot] = await self._call(
+        result: dict[str, OptionsSnapshot] = await self._call(
             self._option_client.get_option_chain, req
         )
         logger.debug(
