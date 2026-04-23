@@ -8,6 +8,7 @@ import PortfolioGreeks from './components/PortfolioGreeks.jsx'
 import TradeHistory from './components/TradeHistory.jsx'
 import PipelineStatus from './components/PipelineStatus.jsx'
 import BacktestUI from './components/BacktestUI.jsx'
+import ParameterOptimizer from './components/ParameterOptimizer.jsx'
 import {
   formatMoney, formatPercent, formatPct, formatTime, formatNumber
 } from './utils/formatting.js'
@@ -163,17 +164,21 @@ export default function App() {
 
         {/* Tab nav */}
         <div className="flex items-center gap-1 ml-4 border border-border rounded overflow-hidden">
-          {['live', 'backtest'].map(t => (
+          {[
+            { id: 'live', label: '● Live' },
+            { id: 'backtest', label: '◈ Backtest' },
+            { id: 'optimizer', label: '⚙ Optimizer' },
+          ].map(({ id, label }) => (
             <button
-              key={t}
-              onClick={() => setTab(t)}
+              key={id}
+              onClick={() => setTab(id)}
               className="text-xs px-3 py-1 uppercase tracking-wider font-bold transition-all"
               style={{
-                background: tab === t ? 'rgba(0,217,255,0.2)' : 'transparent',
-                color: tab === t ? '#00D9FF' : '#6B7280',
+                background: tab === id ? 'rgba(0,217,255,0.2)' : 'transparent',
+                color: tab === id ? '#00D9FF' : '#6B7280',
               }}
             >
-              {t === 'live' ? '● Live' : '◈ Backtest'}
+              {label}
             </button>
           ))}
         </div>
@@ -252,7 +257,7 @@ export default function App() {
         )}
 
         {/* ── Main content ─────────────────────────────────────────────────── */}
-        <main className={`${tab === 'live' ? 'ml-52' : ''} flex-1 p-3 pb-10 min-w-0`}>
+        <main className={`${tab === 'live' ? 'ml-52' : ''} flex-1 p-3 pb-10 min-w-0`} style={{ maxWidth: tab === 'live' ? undefined : '100%' }}>
           {tab === 'live' && (
             <div className="grid grid-cols-3 gap-3">
 
@@ -311,6 +316,10 @@ export default function App() {
 
           {tab === 'backtest' && (
             <BacktestUI get={get} post={post} />
+          )}
+
+          {tab === 'optimizer' && (
+            <ParameterOptimizer get={get} post={post} />
           )}
         </main>
       </div>

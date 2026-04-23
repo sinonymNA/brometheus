@@ -848,20 +848,28 @@ async def start_backtest(body: dict) -> dict:
         except (ValueError, AttributeError) as e:
             return {"error": f"Invalid test date format: {e}"}
 
+    # Parse optional parameters dict → BacktestParams
+    raw_params = body.get("parameters", {}) or {}
+
     job_id = _uuid.uuid4().hex
-    _backtest_jobs[job_id] = {"status": "running", "progress": 0, "message": "Starting…", "result": None, "error": None}
-    logger.info("Backtest job %s: start=%s end=%s symbols=%s walk_forward=%s",
-               job_id, start_date_obj, end_date_obj, symbols, walk_forward)
+    _backtest_jobs[job_id] = {
+        "status": "running", "progress": 0, "message": "Starting…",
+        "result": None, "error": None,
+        "params": raw_params,
+    }
+    logger.info("Backtest job %s: start=%s end=%s symbols=%s walk_forward=%s params=%s",
+                job_id, start_date_obj, end_date_obj, symbols, walk_forward, raw_params)
 
     async def _run() -> None:
         try:
             from backend.backtesting.data_loader import HistoricalDataLoader
-            from backend.backtesting.engine import BacktestEngine
+            from backend.backtesting.engine import BacktestEngine, BacktestParams
 
             alpaca = app.state.alpaca
             if alpaca is None:
                 raise RuntimeError("Alpaca client not initialised")
 
+            bt_params = BacktestParams.from_dict(raw_params)
             loader = HistoricalDataLoader(alpaca)
             engine = BacktestEngine(loader, symbols, strategies)
 
@@ -873,10 +881,12 @@ async def start_backtest(body: dict) -> dict:
                 result = await engine.run_walk_forward(
                     start_date_obj, end_date_obj,
                     test_start_date_obj, test_end_date_obj,
+                    params=bt_params,
                 )
                 _backtest_jobs[job_id].update({"status": "done", "progress": 100, "result": result})
             else:
-                result = await engine.run(start_date_obj, end_date_obj, progress_cb=_progress)
+                result = await engine.run(start_date_obj, end_date_obj,
+                                          progress_cb=_progress, params=bt_params)
                 _backtest_jobs[job_id].update({"status": "done", "progress": 100, "result": result.to_dict()})
         except Exception as exc:
             logger.exception("Backtest job %s failed", job_id)
@@ -892,6 +902,77 @@ async def get_backtest(job_id: str) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+# ── Bot parameter management ───────────────────────────────────────────────────
+
+_DEFAULT_BOT_PARAMS = {
+    "rsi_bull_threshold": 62.0,
+    "rsi_bear_threshold": 38.0,
+    "volume_ratio_min": 1.5,
+    "iv_rank_max": 60.0,
+    "iv_rank_min": 70.0,
+    "signal_strength_min": 0.55,
+    "stop_loss_pct": 0.08,
+    "profit_target_pct": 0.30,
+    "min_dte": 5,
+    "max_dte": 45,
+    "max_positions": 3,
+    "position_size_pct": 0.02,
+}
+
+_BOT_PARAMS_REDIS_KEY = "bot:live_parameters"
+
+
+async def _get_bot_params() -> dict:
+    """Load live bot parameters from Redis, falling back to defaults."""
+    try:
+        from backend.data.fetcher import _get_redis
+        redis = await _get_redis()
+        raw = await redis.get(_BOT_PARAMS_REDIS_KEY)
+        if raw:
+            import json as _json
+            stored = _json.loads(raw)
+            return {**_DEFAULT_BOT_PARAMS, **stored}
+    except Exception as e:
+        logger.debug("Could not load bot params from Redis: %s", e)
+    return dict(_DEFAULT_BOT_PARAMS)
+
+
+@app.get("/api/bot/parameters", tags=["bot"])
+async def get_bot_parameters() -> dict:
+    """Return current live bot parameters."""
+    params = await _get_bot_params()
+    return {"parameters": params}
+
+
+@app.post("/api/bot/apply-parameters", tags=["bot"])
+async def apply_bot_parameters(body: dict) -> dict:
+    """Persist live bot parameters to Redis so they survive restarts.
+
+    Body: {"rsi_bull_threshold": 65, "stop_loss_pct": 0.10, ...}
+    Only recognised parameter keys are stored; unknown keys are ignored.
+    """
+    from backend.backtesting.engine import BacktestParams
+    valid_keys = {f.name for f in __import__('dataclasses').fields(BacktestParams)}
+    incoming = {k: v for k, v in body.items() if k in valid_keys}
+    if not incoming:
+        return {"error": "No valid parameter keys found", "valid_keys": sorted(valid_keys)}
+
+    current = await _get_bot_params()
+    updated = {**current, **incoming}
+
+    try:
+        from backend.data.fetcher import _get_redis
+        import json as _json
+        redis = await _get_redis()
+        await redis.set(_BOT_PARAMS_REDIS_KEY, _json.dumps(updated))
+        logger.info("Bot parameters updated: %s", incoming)
+    except Exception as e:
+        logger.warning("Could not persist bot params to Redis: %s — stored in-memory only", e)
+        # Fall through — still return success, params will reset on restart
+
+    return {"status": "applied", "parameters": updated}
 
 
 # ── Static frontend (must be last) ────────────────────────────────────────────

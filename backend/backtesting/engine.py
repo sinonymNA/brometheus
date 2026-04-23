@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import uuid
 from dataclasses import dataclass, field
+from dataclasses import fields as dc_fields
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -20,12 +21,35 @@ from backend.utils.logger import get_logger
 logger = get_logger(__name__)
 
 STARTING_BALANCE: float = 50_000.0
-MAX_CONCURRENT_POSITIONS: int = 5
-MAX_RISK_PCT: float = 0.02
 MAX_CONTRACTS: int = 10
-MIN_SIGNAL_STRENGTH: float = 0.65   # signals below this are skipped
-STOP_LOSS_BUY: float = 0.08         # exit when long option loses 8% of premium paid
-STOP_LOSS_SELL: float = 0.80        # exit when short position loss reaches 80% of credit
+
+
+@dataclass
+class BacktestParams:
+    """Tunable parameters for a single isolated backtest run.
+
+    All values are per-run only — they never touch live-bot constants.
+    """
+    rsi_bull_threshold: float = 62.0    # RSI above this → overbought
+    rsi_bear_threshold: float = 38.0    # RSI below this → oversold
+    volume_ratio_min: float = 1.5       # call/put volume ratio min for flow strategy
+    iv_rank_max: float = 60.0           # momentum: skip when IV rank % exceeds this
+    iv_rank_min: float = 70.0           # iv_rank strategy: trigger above this %
+    signal_strength_min: float = 0.55   # discard signals below this
+    stop_loss_pct: float = 0.08         # long: exit when premium loses this fraction
+    profit_target_pct: float = 0.30     # exit when gain reaches this fraction
+    min_dte: int = 5                    # close position when DTE ≤ this
+    max_dte: int = 45                   # only enter options with ≤ this DTE
+    max_positions: int = 3              # max concurrent open positions
+    position_size_pct: float = 0.02     # max portfolio fraction risked per trade
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BacktestParams":
+        valid = {f.name for f in dc_fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in valid})
+
+    def to_dict(self) -> dict:
+        return {f.name: getattr(self, f.name) for f in dc_fields(self)}
 
 # ── Internal trade dataclass ──────────────────────────────────────────────────
 
@@ -161,9 +185,10 @@ def _kelly_contracts(
     avg_loss: float,
     strength: float,
     option_price: float,
+    params: BacktestParams,
     recent_trades: list | None = None,
 ) -> int:
-    """Half-Kelly sizing capped at MAX_RISK_PCT and MAX_CONTRACTS.
+    """Half-Kelly sizing capped at params.position_size_pct and MAX_CONTRACTS.
 
     If avg_loss > 2× avg_win from the last 20 closed trades, position
     size is halved until the ratio improves.
@@ -173,13 +198,13 @@ def _kelly_contracts(
     edge = win_rate - (1 - win_rate) * (avg_loss / max(avg_win, 0.01))
     kelly_raw = edge / (avg_loss / max(avg_win, 0.01)) if avg_win > 0 else 0.0
     kelly_f = max(kelly_raw * 0.5 * strength, 0.0)
-    risk_dollars = balance * min(kelly_f, MAX_RISK_PCT)
+    risk_dollars = balance * min(kelly_f, params.position_size_pct)
     contracts = int(risk_dollars / (option_price * 100))
     contracts = max(1, min(contracts, MAX_CONTRACTS))
 
     # Ratio check: reduce size when recent loss-to-win ratio is adverse
     if recent_trades and len(recent_trades) >= 10:
-        recent_wins  = [t.pnl for t in recent_trades[-20:] if (t.pnl or 0) > 0]
+        recent_wins   = [t.pnl for t in recent_trades[-20:] if (t.pnl or 0) > 0]
         recent_losses = [t.pnl for t in recent_trades[-20:] if (t.pnl or 0) < 0]
         if recent_wins and recent_losses:
             r_avg_win  = sum(recent_wins) / len(recent_wins)
@@ -210,32 +235,38 @@ def _eval_momentum(
     sigma: float,
     balance: float,
     today: date,
+    params: BacktestParams,
     spy_spot: float | None = None,
     spy_ma20: float | None = None,
+    iv_rank: float | None = None,
 ) -> list[dict] | None:
     """RSI-based signals with SPY 20d MA market-regime filter.
 
-    Bull regime (SPY > 20d MA): calls only — overbought sell-call, oversold buy-call.
-    Bear regime (SPY < 20d MA): puts only  — overbought sell-put, oversold buy-put.
-    When SPY MA is unavailable the regime filter is skipped.
+    Bull regime (SPY > 20d MA): calls only.
+    Bear regime (SPY < 20d MA): puts only.
+    Skips when IV rank exceeds params.iv_rank_max (vol crush risk).
     """
     rsi = _compute_rsi(closes)
     if rsi is None:
+        return None
+
+    # Skip momentum when implied vol is already expensive
+    if iv_rank is not None and iv_rank > params.iv_rank_max:
         return None
 
     # Determine regime: True=bull, False=bear, None=unknown
     if spy_spot is not None and spy_ma20 is not None:
         bull_regime = spy_spot > spy_ma20
     else:
-        bull_regime = None  # no filter applied
+        bull_regime = None
 
-    expiry = _next_expiry(today, 21)
+    target_dte = min(21, params.max_dte)
+    expiry = _next_expiry(today, target_dte)
     dte = (expiry - today).days
 
-    if rsi > 70:
-        strength = min((rsi - 70) / 30, 1.0)
+    if rsi > params.rsi_bull_threshold:
+        strength = min((rsi - params.rsi_bull_threshold) / (100 - params.rsi_bull_threshold), 1.0)
         if bull_regime is False:
-            # Bear regime: overbought → sell put (stock likely to continue lower)
             strike = round(spot * 0.98, 0)
             price = _option_price(spot, strike, dte, sigma, "put")
             if price < 0.05:
@@ -244,8 +275,7 @@ def _eval_momentum(
                      "signal_type": "overbought_sell_put", "action": "sell",
                      "option_type": "put", "strike": strike,
                      "expiry": expiry, "price": price, "strength": strength}]
-        elif bull_regime is not False:
-            # Bull regime (or unknown): overbought → sell call
+        else:
             strike = round(spot * 1.02, 0)
             price = _option_price(spot, strike, dte, sigma, "call")
             if price < 0.05:
@@ -255,10 +285,9 @@ def _eval_momentum(
                      "option_type": "call", "strike": strike,
                      "expiry": expiry, "price": price, "strength": strength}]
 
-    if rsi < 30:
-        strength = min((30 - rsi) / 30, 1.0)
+    if rsi < params.rsi_bear_threshold:
+        strength = min((params.rsi_bear_threshold - rsi) / params.rsi_bear_threshold, 1.0)
         if bull_regime is False:
-            # Bear regime: oversold → buy put (bounce sell-off continuation)
             strike = round(spot * 0.98, 0)
             price = _option_price(spot, strike, dte, sigma, "put")
             if price < 0.05:
@@ -267,8 +296,7 @@ def _eval_momentum(
                      "signal_type": "oversold_buy_put", "action": "buy",
                      "option_type": "put", "strike": strike,
                      "expiry": expiry, "price": price, "strength": strength}]
-        elif bull_regime is not False:
-            # Bull regime (or unknown): oversold → buy call
+        else:
             strike = round(spot * 0.98, 0)
             price = _option_price(spot, strike, dte, sigma, "call")
             if price < 0.05:
@@ -288,19 +316,21 @@ def _eval_iv_rank(
     vix_history: list[float],
     balance: float,
     today: date,
+    params: BacktestParams,
 ) -> list[dict] | None:
-    """IV rank: high IV → iron condor (sell), low IV → skip."""
+    """IV rank: high IV → iron condor (sell). Threshold from params.iv_rank_min."""
     if len(vix_history) < 10:
         return None
     lo, hi = min(vix_history), max(vix_history)
     if hi <= lo:
         return None
     iv_rank = (current_vix - lo) / (hi - lo)
-    if iv_rank < 0.5:
+    if iv_rank * 100 < params.iv_rank_min:
         return None
 
     sigma = current_vix / 100.0
-    expiry = _next_expiry(today, 30)
+    target_dte = min(30, params.max_dte)
+    expiry = _next_expiry(today, target_dte)
     dte = (expiry - today).days
 
     # Short call spread: sell ATM call, buy OTM call
@@ -338,8 +368,9 @@ def _eval_flow(
     chain: list[dict],
     balance: float,
     today: date,
+    params: BacktestParams,
 ) -> list[dict] | None:
-    """Simulated unusual flow: high call/put vol ratio → buy call."""
+    """Simulated unusual flow: call/put volume ratio above params.volume_ratio_min → buy call."""
     if not chain:
         return None
     call_vol = sum(c["volume"] for c in chain if c["option_type"] == "call")
@@ -347,10 +378,11 @@ def _eval_flow(
     if put_vol == 0:
         return None
     ratio = call_vol / put_vol
-    if ratio < 1.5:
+    if ratio < params.volume_ratio_min:
         return None
 
-    expiry = _next_expiry(today, 14)
+    target_dte = min(14, params.max_dte)
+    expiry = _next_expiry(today, target_dte)
     dte = (expiry - today).days
     strike = round(spot * 1.01, 0)
     price = _option_price(spot, strike, dte, sigma, "call")
@@ -370,17 +402,16 @@ def _check_exit(
     spot: float,
     sigma: float,
     today: date,
+    params: BacktestParams,
 ) -> tuple[bool, str, float]:
     """Returns (should_exit, reason, exit_price)."""
     dte = (trade.expiry - today).days
 
-    # Expiry
     if dte <= 0:
         ep = _current_price(trade, spot, sigma, 0)
         return True, "expiry", ep
 
-    # DTE threshold
-    if dte <= 5:
+    if dte <= params.min_dte:
         ep = _current_price(trade, spot, sigma, dte)
         return True, "dte_close", ep
 
@@ -389,14 +420,17 @@ def _check_exit(
     entry_value = trade.entry_price * 100 * trade.quantity
 
     if trade.action == "sell":
-        if pnl >= entry_value * 0.50:
+        # Profit target: collect params.profit_target_pct of credit
+        if pnl >= entry_value * params.profit_target_pct:
             return True, "profit_target", ep
-        if pnl <= -entry_value * STOP_LOSS_SELL:
+        # Stop: short options stop at 10× the buy stop (credit spread convention)
+        if pnl <= -entry_value * (params.stop_loss_pct * 10):
             return True, "stop_loss", ep
     else:
-        if pnl >= entry_value * 0.75:
+        # Profit target: long options — 2.5× of profit_target_pct for higher upside
+        if pnl >= entry_value * (params.profit_target_pct * 2.5):
             return True, "profit_target", ep
-        if pnl <= -entry_value * STOP_LOSS_BUY:
+        if pnl <= -entry_value * params.stop_loss_pct:
             return True, "stop_loss", ep
 
     return False, "", 0.0
@@ -440,9 +474,13 @@ class BacktestEngine:
         start_date: date,
         end_date: date,
         progress_cb: Any = None,
+        params: BacktestParams | None = None,
     ) -> BacktestResult:
         """Execute day-by-day simulation and return BacktestResult."""
-        logger.info("Backtest run: %s → %s  symbols=%s", start_date, end_date, self._symbols)
+        if params is None:
+            params = BacktestParams()
+        logger.info("Backtest run: %s → %s  symbols=%s  params=%s",
+                    start_date, end_date, self._symbols, params.to_dict())
 
         # ── Load data ────────────────────────────────────────────────────────
         # Always include SPY for the market-regime filter even if the user
@@ -510,6 +548,13 @@ class BacktestEngine:
                 spy_close_list.append(spy_today)
             spy_ma20 = _compute_sma(spy_close_list, 20)
 
+            # IV rank for today (0–100 scale, passed to momentum filter)
+            if len(vix_history_window) >= 10:
+                lo_v, hi_v = min(vix_history_window), max(vix_history_window)
+                iv_rank_today = ((current_vix - lo_v) / (hi_v - lo_v) * 100) if hi_v > lo_v else 0.0
+            else:
+                iv_rank_today = None
+
             # ── Exit checks for open positions ───────────────────────────────
             still_open: list[_BacktestTrade] = []
             for trade in open_trades:
@@ -518,7 +563,7 @@ class BacktestEngine:
                     still_open.append(trade)
                     continue
                 t_sigma = sigma
-                should_exit, reason, exit_price = _check_exit(trade, spot, t_sigma, today)
+                should_exit, reason, exit_price = _check_exit(trade, spot, t_sigma, today, params)
                 if should_exit:
                     pnl = _trade_pnl(trade, exit_price)
                     trade.exit_price = exit_price
@@ -555,27 +600,28 @@ class BacktestEngine:
                     candidates: list[dict] = []
                     if "momentum" in self._strategies:
                         sigs = _eval_momentum(
-                            sym, sym_closes, spot, sigma, balance, today,
+                            sym, sym_closes, spot, sigma, balance, today, params,
                             spy_spot=spy_today, spy_ma20=spy_ma20,
+                            iv_rank=iv_rank_today,
                         )
                         if sigs:
                             candidates.extend(sigs)
                     if "iv_rank" in self._strategies:
-                        sigs = _eval_iv_rank(sym, spot, current_vix, vix_history_window, balance, today)
+                        sigs = _eval_iv_rank(sym, spot, current_vix, vix_history_window, balance, today, params)
                         if sigs:
                             candidates.extend(sigs)
                     if "flow" in self._strategies:
-                        sigs = _eval_flow(sym, spot, sigma, chain, balance, today)
+                        sigs = _eval_flow(sym, spot, sigma, chain, balance, today, params)
                         if sigs:
                             candidates.extend(sigs)
 
                     signals_generated += len(candidates)
 
-                    # Quality filter: skip low-conviction signals
-                    candidates = [s for s in candidates if s.get("strength", 0) > MIN_SIGNAL_STRENGTH]
+                    # Quality filter: discard low-conviction signals
+                    candidates = [s for s in candidates if s.get("strength", 0) > params.signal_strength_min]
 
                     for sig in candidates:
-                        if len(open_trades) >= MAX_CONCURRENT_POSITIONS:
+                        if len(open_trades) >= params.max_positions:
                             break
                         # Avoid duplicate symbol+strategy positions
                         existing = [(t.symbol, t.strategy) for t in open_trades]
@@ -589,11 +635,12 @@ class BacktestEngine:
                             avg_loss=120.0,
                             strength=sig["strength"],
                             option_price=sig["price"],
+                            params=params,
                             recent_trades=closed_trades,
                         )
                         cost = sig["price"] * 100 * qty
-                        if sig["action"] == "buy" and cost > balance * MAX_RISK_PCT * 2:
-                            qty = max(1, int(balance * MAX_RISK_PCT / (sig["price"] * 100)))
+                        if sig["action"] == "buy" and cost > balance * params.position_size_pct * 2:
+                            qty = max(1, int(balance * params.position_size_pct / (sig["price"] * 100)))
 
                         trade = _BacktestTrade(
                             id=uuid.uuid4().hex,
@@ -701,14 +748,15 @@ class BacktestEngine:
         train_end: date,
         test_start: date,
         test_end: date,
+        params: BacktestParams | None = None,
     ) -> dict:
         """Run train window then test window; return comparison dict."""
         logger.info(
             "Walk-forward: train=%s→%s  test=%s→%s",
             train_start, train_end, test_start, test_end,
         )
-        train_result = await self.run(train_start, train_end)
-        test_result = await self.run(test_start, test_end)
+        train_result = await self.run(train_start, train_end, params=params)
+        test_result = await self.run(test_start, test_end, params=params)
 
         return {
             "train": train_result.to_dict(),
