@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 alpaca-trade-api
 alpaca-py
+pytz
 pandas
 numpy
 scipy
