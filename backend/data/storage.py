@@ -27,7 +27,6 @@ from typing import Any
 import asyncpg
 
 from backend.core.greeks_engine import GreeksResult
-from backend.utils.config import settings
 from backend.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -56,6 +55,7 @@ async def init_db() -> None:
     """
     global _pool
 
+    from backend.utils.config import settings
     for attempt in range(_MAX_INIT_RETRIES):
         try:
             _pool = await asyncpg.create_pool(

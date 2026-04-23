@@ -32,7 +32,6 @@ import redis.asyncio as aioredis
 from backend.core.greeks_engine import calculate, calculate_iv
 from backend.data.alpaca_client import alpaca
 from backend.data.storage import save_greeks, save_market_data, save_options_snapshot
-from backend.utils.config import settings
 from backend.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -455,6 +454,7 @@ async def _get_redis() -> aioredis.Redis:  # type: ignore[type-arg]
     """Return the module-level Redis client, initialising it on first call."""
     global _redis
     if _redis is None:
+        from backend.utils.config import settings
         _redis = aioredis.from_url(
             settings.redis_url,
             decode_responses=True,

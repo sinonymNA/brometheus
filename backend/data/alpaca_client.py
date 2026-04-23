@@ -36,7 +36,6 @@ from alpaca.trading.requests import (
     StopOrderRequest,
 )
 
-from backend.utils.config import settings
 from backend.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -85,6 +84,7 @@ class AlpacaClient:
             logger.warning("AlpacaClient.connect() called while already connected; ignoring.")
             return
 
+        from backend.utils.config import settings
         paper: bool = "paper" in settings.alpaca_base_url.lower()
 
         self._trading = TradingClient(
