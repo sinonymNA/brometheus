@@ -23,6 +23,9 @@ STARTING_BALANCE: float = 50_000.0
 MAX_CONCURRENT_POSITIONS: int = 5
 MAX_RISK_PCT: float = 0.02
 MAX_CONTRACTS: int = 10
+MIN_SIGNAL_STRENGTH: float = 0.65   # signals below this are skipped
+STOP_LOSS_BUY: float = 0.08         # exit when long option loses 8% of premium paid
+STOP_LOSS_SELL: float = 0.80        # exit when short position loss reaches 80% of credit
 
 # ── Internal trade dataclass ──────────────────────────────────────────────────
 
@@ -106,7 +109,6 @@ def _compute_rsi(closes: list[float], period: int = 14) -> float | None:
         diff = closes[i] - closes[i - 1]
         gains.append(max(diff, 0.0))
         losses.append(max(-diff, 0.0))
-    # Seed with simple average of first `period` changes
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
     for i in range(period, len(gains)):
@@ -116,6 +118,13 @@ def _compute_rsi(closes: list[float], period: int = 14) -> float | None:
         return 100.0
     rs = avg_gain / avg_loss
     return 100.0 - 100.0 / (1.0 + rs)
+
+
+def _compute_sma(closes: list[float], period: int = 20) -> float | None:
+    """Simple moving average of the last `period` values.  None if insufficient data."""
+    if len(closes) < period:
+        return None
+    return sum(closes[-period:]) / period
 
 
 def _next_expiry(from_date: date, target_dte: int = 30) -> date:
@@ -152,8 +161,13 @@ def _kelly_contracts(
     avg_loss: float,
     strength: float,
     option_price: float,
+    recent_trades: list | None = None,
 ) -> int:
-    """Half-Kelly sizing capped at MAX_RISK_PCT and MAX_CONTRACTS."""
+    """Half-Kelly sizing capped at MAX_RISK_PCT and MAX_CONTRACTS.
+
+    If avg_loss > 2× avg_win from the last 20 closed trades, position
+    size is halved until the ratio improves.
+    """
     if avg_loss <= 0 or option_price <= 0:
         return 1
     edge = win_rate - (1 - win_rate) * (avg_loss / max(avg_win, 0.01))
@@ -161,7 +175,19 @@ def _kelly_contracts(
     kelly_f = max(kelly_raw * 0.5 * strength, 0.0)
     risk_dollars = balance * min(kelly_f, MAX_RISK_PCT)
     contracts = int(risk_dollars / (option_price * 100))
-    return max(1, min(contracts, MAX_CONTRACTS))
+    contracts = max(1, min(contracts, MAX_CONTRACTS))
+
+    # Ratio check: reduce size when recent loss-to-win ratio is adverse
+    if recent_trades and len(recent_trades) >= 10:
+        recent_wins  = [t.pnl for t in recent_trades[-20:] if (t.pnl or 0) > 0]
+        recent_losses = [t.pnl for t in recent_trades[-20:] if (t.pnl or 0) < 0]
+        if recent_wins and recent_losses:
+            r_avg_win  = sum(recent_wins) / len(recent_wins)
+            r_avg_loss = abs(sum(recent_losses) / len(recent_losses))
+            if r_avg_loss > 2.0 * r_avg_win:
+                contracts = max(1, contracts // 2)
+
+    return contracts
 
 
 def _trade_pnl(trade: _BacktestTrade, exit_price: float) -> float:
@@ -184,36 +210,74 @@ def _eval_momentum(
     sigma: float,
     balance: float,
     today: date,
+    spy_spot: float | None = None,
+    spy_ma20: float | None = None,
 ) -> list[dict] | None:
-    """RSI-based signals: RSI>70 → sell call, RSI<30 → buy call."""
+    """RSI-based signals with SPY 20d MA market-regime filter.
+
+    Bull regime (SPY > 20d MA): calls only — overbought sell-call, oversold buy-call.
+    Bear regime (SPY < 20d MA): puts only  — overbought sell-put, oversold buy-put.
+    When SPY MA is unavailable the regime filter is skipped.
+    """
     rsi = _compute_rsi(closes)
     if rsi is None:
         return None
 
+    # Determine regime: True=bull, False=bear, None=unknown
+    if spy_spot is not None and spy_ma20 is not None:
+        bull_regime = spy_spot > spy_ma20
+    else:
+        bull_regime = None  # no filter applied
+
+    expiry = _next_expiry(today, 21)
+    dte = (expiry - today).days
+
     if rsi > 70:
-        expiry = _next_expiry(today, 21)
-        dte = (expiry - today).days
-        strike = round(spot * 1.02, 0)
-        price = _option_price(spot, strike, dte, sigma, "call")
-        if price < 0.05:
-            return None
-        return [{
-            "symbol": symbol, "strategy": "momentum", "signal_type": "overbought_sell_call",
-            "action": "sell", "option_type": "call", "strike": strike,
-            "expiry": expiry, "price": price, "strength": min((rsi - 70) / 30, 1.0),
-        }]
+        strength = min((rsi - 70) / 30, 1.0)
+        if bull_regime is False:
+            # Bear regime: overbought → sell put (stock likely to continue lower)
+            strike = round(spot * 0.98, 0)
+            price = _option_price(spot, strike, dte, sigma, "put")
+            if price < 0.05:
+                return None
+            return [{"symbol": symbol, "strategy": "momentum",
+                     "signal_type": "overbought_sell_put", "action": "sell",
+                     "option_type": "put", "strike": strike,
+                     "expiry": expiry, "price": price, "strength": strength}]
+        elif bull_regime is not False:
+            # Bull regime (or unknown): overbought → sell call
+            strike = round(spot * 1.02, 0)
+            price = _option_price(spot, strike, dte, sigma, "call")
+            if price < 0.05:
+                return None
+            return [{"symbol": symbol, "strategy": "momentum",
+                     "signal_type": "overbought_sell_call", "action": "sell",
+                     "option_type": "call", "strike": strike,
+                     "expiry": expiry, "price": price, "strength": strength}]
+
     if rsi < 30:
-        expiry = _next_expiry(today, 21)
-        dte = (expiry - today).days
-        strike = round(spot * 0.98, 0)
-        price = _option_price(spot, strike, dte, sigma, "call")
-        if price < 0.05:
-            return None
-        return [{
-            "symbol": symbol, "strategy": "momentum", "signal_type": "oversold_buy_call",
-            "action": "buy", "option_type": "call", "strike": strike,
-            "expiry": expiry, "price": price, "strength": min((30 - rsi) / 30, 1.0),
-        }]
+        strength = min((30 - rsi) / 30, 1.0)
+        if bull_regime is False:
+            # Bear regime: oversold → buy put (bounce sell-off continuation)
+            strike = round(spot * 0.98, 0)
+            price = _option_price(spot, strike, dte, sigma, "put")
+            if price < 0.05:
+                return None
+            return [{"symbol": symbol, "strategy": "momentum",
+                     "signal_type": "oversold_buy_put", "action": "buy",
+                     "option_type": "put", "strike": strike,
+                     "expiry": expiry, "price": price, "strength": strength}]
+        elif bull_regime is not False:
+            # Bull regime (or unknown): oversold → buy call
+            strike = round(spot * 0.98, 0)
+            price = _option_price(spot, strike, dte, sigma, "call")
+            if price < 0.05:
+                return None
+            return [{"symbol": symbol, "strategy": "momentum",
+                     "signal_type": "oversold_buy_call", "action": "buy",
+                     "option_type": "call", "strike": strike,
+                     "expiry": expiry, "price": price, "strength": strength}]
+
     return None
 
 
@@ -324,17 +388,15 @@ def _check_exit(
     pnl = _trade_pnl(trade, ep)
     entry_value = trade.entry_price * 100 * trade.quantity
 
-    # Profit target: 50% of credit collected (for sells) or 50% gain (for buys)
     if trade.action == "sell":
         if pnl >= entry_value * 0.50:
             return True, "profit_target", ep
-        # Stop loss: 2× credit collected
-        if pnl <= -entry_value * 2.0:
+        if pnl <= -entry_value * STOP_LOSS_SELL:
             return True, "stop_loss", ep
     else:
         if pnl >= entry_value * 0.75:
             return True, "profit_target", ep
-        if pnl <= -entry_value * 0.40:
+        if pnl <= -entry_value * STOP_LOSS_BUY:
             return True, "stop_loss", ep
 
     return False, "", 0.0
@@ -383,13 +445,17 @@ class BacktestEngine:
         logger.info("Backtest run: %s → %s  symbols=%s", start_date, end_date, self._symbols)
 
         # ── Load data ────────────────────────────────────────────────────────
-        bars_map = await self._loader.load_stock_data(self._symbols, start_date, end_date)
+        # Always include SPY for the market-regime filter even if the user
+        # didn't explicitly request it; deduplicate to avoid double-loading.
+        load_symbols = list(dict.fromkeys(["SPY"] + self._symbols))
+        bars_map = await self._loader.load_stock_data(load_symbols, start_date, end_date)
         vix_map = await self._loader.load_vix_data(start_date, end_date)
 
-        # Build sorted list of trading days (intersection across all symbols)
+        # Build sorted list of trading days (intersection across strategy symbols)
+        strategy_symbols = [s for s in self._symbols if s in bars_map]
         day_sets = [
-            {b.timestamp.date() for b in bars}
-            for bars in bars_map.values()
+            {b.timestamp.date() for b in bars_map[s]}
+            for s in strategy_symbols
         ]
         if not day_sets:
             raise ValueError("No bar data loaded")
@@ -413,6 +479,9 @@ class BacktestEngine:
         for sym, bars in bars_map.items():
             closes_by_symbol[sym] = {b.timestamp.date(): b.close for b in bars}
 
+        # SPY close list ordered by trading_days for rolling MA computation
+        spy_close_list: list[float] = []
+
         vix_history_window: list[float] = []
         total_days = len(trading_days)
 
@@ -434,6 +503,12 @@ class BacktestEngine:
                 vix_history_window.pop(0)
 
             sigma = max(current_vix / 100.0, 0.05)
+
+            # SPY regime: update rolling close list and compute 20d MA
+            spy_today = closes_by_symbol.get("SPY", {}).get(today)
+            if spy_today:
+                spy_close_list.append(spy_today)
+            spy_ma20 = _compute_sma(spy_close_list, 20)
 
             # ── Exit checks for open positions ───────────────────────────────
             still_open: list[_BacktestTrade] = []
@@ -479,7 +554,10 @@ class BacktestEngine:
 
                     candidates: list[dict] = []
                     if "momentum" in self._strategies:
-                        sigs = _eval_momentum(sym, sym_closes, spot, sigma, balance, today)
+                        sigs = _eval_momentum(
+                            sym, sym_closes, spot, sigma, balance, today,
+                            spy_spot=spy_today, spy_ma20=spy_ma20,
+                        )
                         if sigs:
                             candidates.extend(sigs)
                     if "iv_rank" in self._strategies:
@@ -493,6 +571,9 @@ class BacktestEngine:
 
                     signals_generated += len(candidates)
 
+                    # Quality filter: skip low-conviction signals
+                    candidates = [s for s in candidates if s.get("strength", 0) > MIN_SIGNAL_STRENGTH]
+
                     for sig in candidates:
                         if len(open_trades) >= MAX_CONCURRENT_POSITIONS:
                             break
@@ -503,11 +584,12 @@ class BacktestEngine:
 
                         qty = _kelly_contracts(
                             balance,
-                            win_rate=0.55,       # prior estimate
+                            win_rate=0.55,
                             avg_win=200.0,
                             avg_loss=120.0,
                             strength=sig["strength"],
                             option_price=sig["price"],
+                            recent_trades=closed_trades,
                         )
                         cost = sig["price"] * 100 * qty
                         if sig["action"] == "buy" and cost > balance * MAX_RISK_PCT * 2:
