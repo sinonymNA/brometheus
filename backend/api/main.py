@@ -10,6 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend.data.alpaca_client import AlpacaClient
+from backend.data.fetcher import start as start_fetcher
+from backend.data.fetcher import stop as stop_fetcher
 from backend.data.storage import close_db, init_db
 from backend.utils.logger import get_logger
 
@@ -100,6 +102,9 @@ async def on_startup() -> None:
     except Exception as exc:
         logger.error("Database failed to initialise: %s", exc)
 
+    # ── Data fetcher ──────────────────────────────────────────────────────────
+    await start_fetcher()
+
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
@@ -108,6 +113,7 @@ async def on_shutdown() -> None:
     client: AlpacaClient | None = getattr(app.state, "alpaca", None)
     if client is not None:
         client.disconnect()
+    await stop_fetcher()
     await close_db()
 
 
