@@ -300,9 +300,28 @@ class AlpacaClient:
             end=end,
         )
         raw = await self._call(self._stock_client.get_stock_bars, req)
-        # BarSet is dict-like: symbol -> list[Bar]
-        result: dict[str, list[Bar]] = {sym: list(bars) for sym, bars in raw.items()}
-        logger.debug("Fetched %s bars for %s", timeframe, symbols)
+        # BarSet is dict-like but may be a Pydantic model; handle both cases
+        result: dict[str, list[Bar]] = {}
+        try:
+            # Try dict-like access first (.items() method)
+            if hasattr(raw, 'items') and callable(getattr(raw, 'items', None)):
+                result = {sym: list(bars) for sym, bars in raw.items()}
+            else:
+                # Fallback: iterate over BarSet directly or use __iter__
+                for symbol in symbols:
+                    if symbol in raw:
+                        result[symbol] = list(raw[symbol])
+                    elif hasattr(raw, symbol):
+                        result[symbol] = list(getattr(raw, symbol))
+        except Exception as e:
+            logger.warning("Failed to convert BarSet with standard method: %s. Trying dict()", e)
+            try:
+                result = dict(raw)
+            except Exception as e2:
+                logger.error("Failed to convert BarSet: %s", e2)
+                raise
+        logger.debug("Fetched %d symbols with %d total bars for timeframe %s",
+                    len(result), sum(len(bars) for bars in result.values()), timeframe)
         return result
 
     # ── Order placement ───────────────────────────────────────────────────────
