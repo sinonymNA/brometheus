@@ -10,9 +10,10 @@ import statistics
 import traceback
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -86,6 +87,28 @@ class _WSManager:
 _ws_manager = _WSManager()
 
 # ── Error handling ────────────────────────────────────────────────────────────
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    errors = []
+    for error in exc.errors():
+        loc = " → ".join(str(x) for x in error["loc"])
+        msg = error["msg"]
+        errors.append({"path": loc, "error": msg})
+    logger.warning(
+        "Validation error on %s %s: %s",
+        request.method, request.url.path,
+        ", ".join(f"{e['path']}: {e['error']}" for e in errors),
+    )
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "Request validation failed",
+            "errors": errors,
+            "hint": "Check field names, types, and required fields",
+        },
+    )
 
 
 @app.exception_handler(Exception)
@@ -741,21 +764,80 @@ async def backtest_presets() -> dict:
     }
 
 
-class _BacktestRequest(BaseModel):
-    start_date: date
-    end_date: date
-    symbols: list[str] = ["SPY", "QQQ", "AAPL"]
-    strategies: list[str] = ["momentum", "iv_rank", "flow"]
-    walk_forward: bool = False
-    test_start_date: Optional[date] = None
-    test_end_date: Optional[date] = None
-
-
 @app.post("/api/backtest", tags=["backtest"])
-async def start_backtest(req: _BacktestRequest) -> dict:
+async def start_backtest(body: dict) -> dict:
+    """Run a backtest. Accepts flexible request formats.
+
+    Format A (dates as strings):
+      {"start_date": "2024-03-01", "end_date": "2024-05-01"}
+
+    Format B (with symbols/strategies):
+      {"start_date": "...", "end_date": "...", "symbols": [...], "strategies": [...]}
+
+    Format C (preset name):
+      {"preset": "2023_full"}
+    """
     import uuid as _uuid
+
+    logger.info("Backtest request received: %s", body)
+
+    # Parse preset or manual date range
+    preset_map = {
+        "2023_full": {"start_date": "2023-01-03", "end_date": "2023-12-29"},
+        "2022_bear": {"start_date": "2022-01-03", "end_date": "2022-12-30"},
+        "ytd": {"start_date": f"{date.today().year}-01-02", "end_date": date.today().isoformat()},
+    }
+
+    if "preset" in body:
+        preset_name = body["preset"]
+        if preset_name not in preset_map:
+            return {
+                "error": f"Unknown preset '{preset_name}'. Valid: {list(preset_map.keys())}"
+            }
+        preset_data = preset_map[preset_name]
+        start_date_str = preset_data["start_date"]
+        end_date_str = preset_data["end_date"]
+    else:
+        start_date_str = body.get("start_date")
+        end_date_str = body.get("end_date")
+
+    # Validate dates
+    if not start_date_str or not end_date_str:
+        return {
+            "error": "Missing start_date and/or end_date. "
+                    "Provide as strings (YYYY-MM-DD) or use a preset name."
+        }
+
+    try:
+        start_date_obj = date.fromisoformat(start_date_str) if isinstance(start_date_str, str) else start_date_str
+        end_date_obj = date.fromisoformat(end_date_str) if isinstance(end_date_str, str) else end_date_str
+    except (ValueError, AttributeError) as e:
+        return {
+            "error": f"Invalid date format: {e}. Use YYYY-MM-DD (e.g., 2024-03-01)"
+        }
+
+    symbols = body.get("symbols", ["SPY", "QQQ", "AAPL"])
+    if isinstance(symbols, str):
+        symbols = [s.strip().upper() for s in symbols.split(",")]
+    strategies = body.get("strategies", ["momentum", "iv_rank", "flow"])
+    walk_forward = body.get("walk_forward", False)
+
+    test_start_date_str = body.get("test_start_date")
+    test_end_date_str = body.get("test_end_date")
+    test_start_date_obj = None
+    test_end_date_obj = None
+
+    if walk_forward and test_start_date_str and test_end_date_str:
+        try:
+            test_start_date_obj = date.fromisoformat(test_start_date_str) if isinstance(test_start_date_str, str) else test_start_date_str
+            test_end_date_obj = date.fromisoformat(test_end_date_str) if isinstance(test_end_date_str, str) else test_end_date_str
+        except (ValueError, AttributeError) as e:
+            return {"error": f"Invalid test date format: {e}"}
+
     job_id = _uuid.uuid4().hex
     _backtest_jobs[job_id] = {"status": "running", "progress": 0, "message": "Starting…", "result": None, "error": None}
+    logger.info("Backtest job %s: start=%s end=%s symbols=%s walk_forward=%s",
+               job_id, start_date_obj, end_date_obj, symbols, walk_forward)
 
     async def _run() -> None:
         try:
@@ -767,20 +849,20 @@ async def start_backtest(req: _BacktestRequest) -> dict:
                 raise RuntimeError("Alpaca client not initialised")
 
             loader = HistoricalDataLoader(alpaca)
-            engine = BacktestEngine(loader, req.symbols, req.strategies)
+            engine = BacktestEngine(loader, symbols, strategies)
 
             async def _progress(pct: int, msg: str) -> None:
                 _backtest_jobs[job_id]["progress"] = pct
                 _backtest_jobs[job_id]["message"] = msg
 
-            if req.walk_forward and req.test_start_date and req.test_end_date:
+            if walk_forward and test_start_date_obj and test_end_date_obj:
                 result = await engine.run_walk_forward(
-                    req.start_date, req.end_date,
-                    req.test_start_date, req.test_end_date,
+                    start_date_obj, end_date_obj,
+                    test_start_date_obj, test_end_date_obj,
                 )
                 _backtest_jobs[job_id].update({"status": "done", "progress": 100, "result": result})
             else:
-                result = await engine.run(req.start_date, req.end_date, progress_cb=_progress)
+                result = await engine.run(start_date_obj, end_date_obj, progress_cb=_progress)
                 _backtest_jobs[job_id].update({"status": "done", "progress": 100, "result": result.to_dict()})
         except Exception as exc:
             logger.exception("Backtest job %s failed", job_id)

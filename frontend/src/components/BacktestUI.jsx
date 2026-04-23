@@ -450,7 +450,10 @@ export default function BacktestUI({ get, post }) {
 
   const handleRun = useCallback(async () => {
     const params = customParams.start_date && customParams.end_date ? customParams : selected
-    if (!params) return
+    if (!params) {
+      setJobStatus({ status: 'error', error: 'Please select a preset or enter start/end dates' })
+      return
+    }
 
     const body = {
       start_date: params.start_date || customParams.start_date,
@@ -464,13 +467,19 @@ export default function BacktestUI({ get, post }) {
       body.test_end_date = customParams.test_end_date || null
     }
 
+    console.log('[BacktestUI] Submitting request:', JSON.stringify(body, null, 2))
     setJobStatus({ status: 'running', progress: 0, message: 'Submitting…' })
+
     const resp = await post('/api/backtest', body)
+    console.log('[BacktestUI] Response:', resp)
+
     if (resp?.job_id) {
       setJobId(resp.job_id)
       startPoll(resp.job_id)
+    } else if (resp?.error) {
+      setJobStatus({ status: 'error', error: resp.error })
     } else {
-      setJobStatus({ status: 'error', error: 'Failed to start backtest' })
+      setJobStatus({ status: 'error', error: resp?.detail || 'Failed to start backtest' })
     }
   }, [customParams, selected, symbols, strategies, post, startPoll])
 
@@ -522,13 +531,17 @@ export default function BacktestUI({ get, post }) {
             >
               {isRunning ? '⟳ Running…' : '▶ Run Backtest'}
             </button>
-            {isError && (
-              <span className="text-xs neg">Error: {jobStatus.error}</span>
-            )}
           </div>
 
           {isRunning && (
             <ProgressBar pct={jobStatus.progress || 0} message={jobStatus.message} />
+          )}
+
+          {isError && (
+            <div className="p-2 rounded" style={{ background: 'rgba(255, 0, 85, 0.1)', border: '1px solid #FF0055' }}>
+              <div className="text-xs neg font-semibold mb-1">Backtest Error</div>
+              <div className="text-xs muted whitespace-pre-wrap break-words">{jobStatus.error}</div>
+            </div>
           )}
         </div>
       </Card>
