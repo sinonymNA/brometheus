@@ -113,6 +113,23 @@ class AlpacaClient:
         self._option_data = None
         logger.info("Alpaca clients disconnected.")
 
+    async def health_check(self) -> bool:
+        """Verify the Alpaca API is reachable by fetching account info.
+
+        Returns:
+            ``True`` if the trading account endpoint responds successfully.
+            ``False`` if the client is not connected or the request fails for
+            any reason (network error, bad credentials, etc.).
+        """
+        if self._trading is None:
+            return False
+        try:
+            await self._call(self._trading_client.get_account)
+            return True
+        except Exception as exc:
+            logger.warning("Alpaca health check failed: %s", exc)
+            return False
+
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     @property

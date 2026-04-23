@@ -9,6 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from backend.data.alpaca_client import AlpacaClient
 from backend.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -60,34 +61,63 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    """Validate configuration and log startup confirmation."""
-    # Import here so a missing env var surfaces immediately on startup with a clear error.
-    from backend.utils.config import settings  # noqa: F401
+    """Initialise the Alpaca client and verify connectivity.
+
+    Stores ``app.state.alpaca`` (:class:`~backend.data.alpaca_client.AlpacaClient`)
+    and ``app.state.alpaca_connected`` (``bool``) so that route handlers can read
+    live connection status without re-importing the client module.
+
+    A failure to connect is logged as an error but does **not** abort startup —
+    the app remains available and ``/health`` will report
+    ``alpaca_connected: false``.
+    """
+    from backend.utils.config import settings
 
     logger.info("APEX CRUSHER starting… version=%s", _VERSION)
     logger.info("Alpaca base URL: %s", settings.alpaca_base_url)
 
+    client = AlpacaClient()
+    connected = False
+
+    try:
+        client.connect()
+        connected = await client.health_check()
+        if connected:
+            logger.info("Alpaca connection verified.")
+        else:
+            logger.warning("Alpaca client initialised but health check returned False.")
+    except Exception as exc:
+        logger.error("Alpaca failed to initialise: %s", exc)
+
+    app.state.alpaca = client
+    app.state.alpaca_connected = connected
+
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
-    """Log shutdown and release any held resources."""
+    """Disconnect the Alpaca client and log shutdown."""
     logger.info("APEX CRUSHER shutting down…")
+    client: AlpacaClient | None = getattr(app.state, "alpaca", None)
+    if client is not None:
+        client.disconnect()
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 
 @app.get("/health", tags=["meta"])
-async def health() -> dict[str, str]:
-    """Return service liveness information.
+async def health() -> dict[str, str | bool]:
+    """Return service liveness and dependency health.
 
     Returns:
-        A dict containing ``status``, ``timestamp`` (ISO 8601 UTC), and ``version``.
+        A dict with ``status``, ``timestamp`` (ISO 8601 UTC), ``version``,
+        and ``alpaca_connected`` (``bool``).
     """
     return {
         "status": "ok",
         "timestamp": _utc_now(),
         "version": _VERSION,
+        "alpaca_connected": getattr(app.state, "alpaca_connected", False),
     }
 
 
