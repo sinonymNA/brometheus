@@ -13,6 +13,7 @@ asyncpg
 sqlalchemy[asyncio]
 websockets
 aiohttp
+yfinance
 pytest
 pytest-asyncio
 httpx

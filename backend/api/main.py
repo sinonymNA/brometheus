@@ -16,6 +16,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSock
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from backend.data.alpaca_client import AlpacaClient
 from backend.data.fetcher import (
@@ -693,6 +694,108 @@ async def _opt_mid(symbol: str) -> float | None:
         return round((float(row["bid"]) + float(row["ask"])) / 2, 4)
     except Exception:
         return None
+
+
+# ── Backtesting ───────────────────────────────────────────────────────────────
+
+_backtest_jobs: dict[str, dict] = {}   # job_id → {status, progress, result, error}
+
+
+@app.get("/api/backtest/presets", tags=["backtest"])
+async def backtest_presets() -> dict:
+    today = date.today()
+    return {
+        "presets": [
+            {
+                "id": "2023_full",
+                "label": "2023 Full Year",
+                "start_date": "2023-01-03",
+                "end_date": "2023-12-29",
+                "description": "Bull market recovery",
+            },
+            {
+                "id": "2022_bear",
+                "label": "2022 Bear Market",
+                "start_date": "2022-01-03",
+                "end_date": "2022-12-30",
+                "description": "High-volatility bear market",
+            },
+            {
+                "id": "walk_forward",
+                "label": "Walk-Forward (train 2022-2023, test 2024)",
+                "start_date": "2022-01-03",
+                "end_date": "2023-12-29",
+                "test_start_date": "2024-01-02",
+                "test_end_date": "2024-12-31",
+                "description": "Train on 2022-2023, validate on 2024",
+                "walk_forward": True,
+            },
+            {
+                "id": "ytd",
+                "label": "Year-to-Date",
+                "start_date": f"{today.year}-01-02",
+                "end_date": today.isoformat(),
+                "description": "Current year performance",
+            },
+        ]
+    }
+
+
+class _BacktestRequest(BaseModel):
+    start_date: date
+    end_date: date
+    symbols: list[str] = ["SPY", "QQQ", "AAPL"]
+    strategies: list[str] = ["momentum", "iv_rank", "flow"]
+    walk_forward: bool = False
+    test_start_date: date | None = None
+    test_end_date: date | None = None
+
+
+@app.post("/api/backtest", tags=["backtest"])
+async def start_backtest(req: _BacktestRequest) -> dict:
+    import uuid as _uuid
+    job_id = _uuid.uuid4().hex
+    _backtest_jobs[job_id] = {"status": "running", "progress": 0, "message": "Starting…", "result": None, "error": None}
+
+    async def _run() -> None:
+        try:
+            from backend.backtesting.data_loader import HistoricalDataLoader
+            from backend.backtesting.engine import BacktestEngine
+
+            alpaca = app.state.alpaca
+            if alpaca is None:
+                raise RuntimeError("Alpaca client not initialised")
+
+            loader = HistoricalDataLoader(alpaca)
+            engine = BacktestEngine(loader, req.symbols, req.strategies)
+
+            async def _progress(pct: int, msg: str) -> None:
+                _backtest_jobs[job_id]["progress"] = pct
+                _backtest_jobs[job_id]["message"] = msg
+
+            if req.walk_forward and req.test_start_date and req.test_end_date:
+                result = await engine.run_walk_forward(
+                    req.start_date, req.end_date,
+                    req.test_start_date, req.test_end_date,
+                )
+                _backtest_jobs[job_id].update({"status": "done", "progress": 100, "result": result})
+            else:
+                result = await engine.run(req.start_date, req.end_date, progress_cb=_progress)
+                _backtest_jobs[job_id].update({"status": "done", "progress": 100, "result": result.to_dict()})
+        except Exception as exc:
+            logger.exception("Backtest job %s failed", job_id)
+            _backtest_jobs[job_id].update({"status": "error", "error": str(exc)})
+
+    asyncio.create_task(_run())
+    return {"job_id": job_id}
+
+
+@app.get("/api/backtest/{job_id}", tags=["backtest"])
+async def get_backtest(job_id: str) -> dict:
+    job = _backtest_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 # ── Static frontend (must be last) ────────────────────────────────────────────

@@ -7,6 +7,7 @@ import SignalFeed from './components/SignalFeed.jsx'
 import PortfolioGreeks from './components/PortfolioGreeks.jsx'
 import TradeHistory from './components/TradeHistory.jsx'
 import PipelineStatus from './components/PipelineStatus.jsx'
+import BacktestUI from './components/BacktestUI.jsx'
 import {
   formatMoney, formatPercent, formatPct, formatTime, formatNumber
 } from './utils/formatting.js'
@@ -48,6 +49,7 @@ function Stat({ label, value, color, large = false }) {
 export default function App() {
   const { data: ws, connected, lastUpdate } = useWebSocket()
   const { get, post } = useAPI()
+  const [tab, setTab] = useState('live')
 
   // Derived from WebSocket
   const balance      = ws?.balance      ?? 50000
@@ -159,6 +161,23 @@ export default function App() {
           </span>
         </div>
 
+        {/* Tab nav */}
+        <div className="flex items-center gap-1 ml-4 border border-border rounded overflow-hidden">
+          {['live', 'backtest'].map(t => (
+            <button
+              key={t}
+              onClick={() => setTab(t)}
+              className="text-xs px-3 py-1 uppercase tracking-wider font-bold transition-all"
+              style={{
+                background: tab === t ? 'rgba(0,217,255,0.2)' : 'transparent',
+                color: tab === t ? '#00D9FF' : '#6B7280',
+              }}
+            >
+              {t === 'live' ? '● Live' : '◈ Backtest'}
+            </button>
+          ))}
+        </div>
+
         <div className="flex-1" />
 
         {/* Emergency controls */}
@@ -184,107 +203,115 @@ export default function App() {
       {/* ── Body: sidebar + main ─────────────────────────────────────────────── */}
       <div className="flex flex-1 pt-12">
 
-        {/* ── Sidebar ────────────────────────────────────────────────────────── */}
-        <aside
-          className="fixed top-12 left-0 bottom-8 w-52 border-r border-border flex flex-col overflow-y-auto"
-          style={{ background: '#0A0E27' }}
-        >
-          <div className="px-3 pt-3 pb-1">
-            <span className="text-xs muted uppercase tracking-widest">Performance</span>
-          </div>
+        {/* ── Sidebar (live tab only) ─────────────────────────────────────────── */}
+        {tab === 'live' && (
+          <aside
+            className="fixed top-12 left-0 bottom-8 w-52 border-r border-border flex flex-col overflow-y-auto"
+            style={{ background: '#0A0E27' }}
+          >
+            <div className="px-3 pt-3 pb-1">
+              <span className="text-xs muted uppercase tracking-widest">Performance</span>
+            </div>
 
-          <Stat
-            label="Net P&L All-Time"
-            value={formatMoney(totalPnl)}
-            color={totalPnl >= 0 ? '#00FF88' : '#FF0055'}
-            large
-          />
-          <Stat
-            label="Win Rate"
-            value={formatPct(winRate * 100)}
-            color={winRate >= 0.5 ? '#00FF88' : winRate >= 0.4 ? '#FFB800' : '#FF0055'}
-          />
-          <Stat
-            label="Profit Factor"
-            value={profitFactor != null ? formatNumber(profitFactor) : '—'}
-            color={profitFactor != null && profitFactor >= 1.5 ? '#00FF88' : '#E8EAED'}
-          />
-          <Stat
-            label="Drawdown"
-            value={formatPct(drawdownPct * 100)}
-            color={drawdownPct >= 0.05 ? '#FF0055' : drawdownPct >= 0.03 ? '#FFB800' : '#6B7280'}
-          />
-          <Stat
-            label="Sharpe (est)"
-            value={sharpe != null ? formatNumber(sharpe) : '—'}
-            color={sharpe != null && sharpe >= 1 ? '#00FF88' : '#E8EAED'}
-          />
-          <Stat
-            label="Total Trades"
-            value={totalTrades.toLocaleString()}
-          />
-          <Stat
-            label="Open Positions"
-            value={positions.length}
-            color={positions.length > 0 ? '#00D9FF' : '#6B7280'}
-          />
-        </aside>
+            <Stat
+              label="Net P&L All-Time"
+              value={formatMoney(totalPnl)}
+              color={totalPnl >= 0 ? '#00FF88' : '#FF0055'}
+              large
+            />
+            <Stat
+              label="Win Rate"
+              value={formatPct(winRate * 100)}
+              color={winRate >= 0.5 ? '#00FF88' : winRate >= 0.4 ? '#FFB800' : '#FF0055'}
+            />
+            <Stat
+              label="Profit Factor"
+              value={profitFactor != null ? formatNumber(profitFactor) : '—'}
+              color={profitFactor != null && profitFactor >= 1.5 ? '#00FF88' : '#E8EAED'}
+            />
+            <Stat
+              label="Drawdown"
+              value={formatPct(drawdownPct * 100)}
+              color={drawdownPct >= 0.05 ? '#FF0055' : drawdownPct >= 0.03 ? '#FFB800' : '#6B7280'}
+            />
+            <Stat
+              label="Sharpe (est)"
+              value={sharpe != null ? formatNumber(sharpe) : '—'}
+              color={sharpe != null && sharpe >= 1 ? '#00FF88' : '#E8EAED'}
+            />
+            <Stat
+              label="Total Trades"
+              value={totalTrades.toLocaleString()}
+            />
+            <Stat
+              label="Open Positions"
+              value={positions.length}
+              color={positions.length > 0 ? '#00D9FF' : '#6B7280'}
+            />
+          </aside>
+        )}
 
         {/* ── Main content ─────────────────────────────────────────────────── */}
-        <main className="ml-52 flex-1 p-3 pb-10 min-w-0">
-          <div className="grid grid-cols-3 gap-3">
+        <main className={`${tab === 'live' ? 'ml-52' : ''} flex-1 p-3 pb-10 min-w-0`}>
+          {tab === 'live' && (
+            <div className="grid grid-cols-3 gap-3">
 
-            {/* ── Column 1: Positions + Signals ──────────────────────────── */}
-            <div className="flex flex-col gap-3">
-              <Card title={`Active Positions (${positions.length})`}>
-                <PositionsTable positions={positions} />
-              </Card>
+              {/* ── Column 1: Positions + Signals ──────────────────────────── */}
+              <div className="flex flex-col gap-3">
+                <Card title={`Active Positions (${positions.length})`}>
+                  <PositionsTable positions={positions} />
+                </Card>
 
-              <Card title="Live Signal Feed">
-                <SignalFeed signals={signals} />
-              </Card>
-            </div>
+                <Card title="Live Signal Feed">
+                  <SignalFeed signals={signals} />
+                </Card>
+              </div>
 
-            {/* ── Column 2: Equity Curve + Greeks ────────────────────────── */}
-            <div className="flex flex-col gap-3">
-              <Card title="Equity Curve">
-                <div className="p-2">
-                  <div className="flex justify-between items-baseline mb-2 px-1">
-                    <span className="text-xs muted">60-day running balance</span>
-                    <span
-                      className="font-mono font-bold text-sm"
-                      style={{ color: balance >= 50000 ? '#00FF88' : '#FF0055' }}
-                    >
-                      {formatMoney(balance)}
-                    </span>
+              {/* ── Column 2: Equity Curve + Greeks ────────────────────────── */}
+              <div className="flex flex-col gap-3">
+                <Card title="Equity Curve">
+                  <div className="p-2">
+                    <div className="flex justify-between items-baseline mb-2 px-1">
+                      <span className="text-xs muted">60-day running balance</span>
+                      <span
+                        className="font-mono font-bold text-sm"
+                        style={{ color: balance >= 50000 ? '#00FF88' : '#FF0055' }}
+                      >
+                        {formatMoney(balance)}
+                      </span>
+                    </div>
+                    <EquityCurve curve={equityCurve} balance={balance} />
                   </div>
-                  <EquityCurve curve={equityCurve} balance={balance} />
-                </div>
-              </Card>
+                </Card>
 
-              <Card title="Portfolio Greeks">
-                <PortfolioGreeks greeks={greeks} />
-              </Card>
+                <Card title="Portfolio Greeks">
+                  <PortfolioGreeks greeks={greeks} />
+                </Card>
+              </div>
+
+              {/* ── Column 3: Trade History + Pipeline ─────────────────────── */}
+              <div className="flex flex-col gap-3">
+                <Card title="Trade History (last 20)">
+                  <TradeHistory trades={ws ? [] : []} />
+                  <HistoryLoader get={get} />
+                </Card>
+
+                <Card title="Pipeline Status">
+                  <PipelineStatus
+                    pipelineState={pipeline}
+                    alpacaConnected={health?.alpaca_connected ?? false}
+                    redisConnected={health?.db_connected ?? false}
+                    marketOpen={marketOpen}
+                  />
+                </Card>
+              </div>
+
             </div>
+          )}
 
-            {/* ── Column 3: Trade History + Pipeline ─────────────────────── */}
-            <div className="flex flex-col gap-3">
-              <Card title="Trade History (last 20)">
-                <TradeHistory trades={ws ? [] : []} />
-                <HistoryLoader get={get} />
-              </Card>
-
-              <Card title="Pipeline Status">
-                <PipelineStatus
-                  pipelineState={pipeline}
-                  alpacaConnected={health?.alpaca_connected ?? false}
-                  redisConnected={health?.db_connected ?? false}
-                  marketOpen={marketOpen}
-                />
-              </Card>
-            </div>
-
-          </div>
+          {tab === 'backtest' && (
+            <BacktestUI get={get} post={post} />
+          )}
         </main>
       </div>
 
