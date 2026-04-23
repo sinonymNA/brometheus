@@ -62,6 +62,7 @@ async def init_db() -> None:
                 settings.database_url,
                 min_size=2,
                 max_size=10,
+                timeout=10,          # per-connection timeout; prevents 60s hangs
                 command_timeout=30,
             )
             logger.info("Database pool created (min=2, max=10).")
