@@ -56,10 +56,15 @@ async def init_db() -> None:
     global _pool
 
     from backend.utils.config import settings
+    db_url = settings.database_url
+    # asyncpg requires "postgresql://" — Railway sometimes provides "postgres://"
+    if db_url.startswith("postgres://"):
+        db_url = "postgresql://" + db_url[len("postgres://"):]
+
     for attempt in range(_MAX_INIT_RETRIES):
         try:
             _pool = await asyncpg.create_pool(
-                settings.database_url,
+                db_url,
                 min_size=2,
                 max_size=10,
                 timeout=10,          # per-connection timeout; prevents 60s hangs
@@ -97,15 +102,12 @@ async def close_db() -> None:
         logger.info("Database pool closed.")
 
 
-def get_pool() -> asyncpg.Pool:
-    """Return the active connection pool.
-
-    Raises:
-        RuntimeError: If :func:`init_db` has not been called yet.
-    """
+async def get_pool() -> asyncpg.Pool:
+    """Return the active connection pool, initialising it on first use if needed."""
+    global _pool
     if _pool is None:
-        raise RuntimeError("Database pool is not initialised. Call init_db() first.")
-    return _pool
+        await init_db()
+    return _pool  # type: ignore[return-value]
 
 
 # ── Market data ───────────────────────────────────────────────────────────────
@@ -133,7 +135,7 @@ async def save_market_data(
         The newly inserted row ID.
     """
     ts = timestamp or datetime.now(timezone.utc)
-    async with get_pool().acquire() as conn:
+    async with (await get_pool()).acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO market_data (symbol, timestamp, price, volume, bid, ask)
@@ -166,7 +168,7 @@ async def save_options_snapshot(options: list[dict[str, Any]]) -> list[int]:
         return []
 
     ids: list[int] = []
-    async with get_pool().acquire() as conn:
+    async with (await get_pool()).acquire() as conn:
         async with conn.transaction():
             stmt = await conn.prepare(
                 """
@@ -214,7 +216,7 @@ async def save_greeks(
     Returns:
         The newly inserted row ID.
     """
-    async with get_pool().acquire() as conn:
+    async with (await get_pool()).acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO calculated_greeks
@@ -259,7 +261,7 @@ async def save_signal(
     Returns:
         The newly inserted signal ID.
     """
-    async with get_pool().acquire() as conn:
+    async with (await get_pool()).acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO signals
@@ -297,7 +299,7 @@ async def save_trade(trade: dict[str, Any]) -> int:
     Returns:
         The newly inserted trade ID.
     """
-    async with get_pool().acquire() as conn:
+    async with (await get_pool()).acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO trades
@@ -331,7 +333,7 @@ async def update_trade_closed(trade_id: int, exit_price: float, pnl: float) -> N
         exit_price: Fill price of the closing order.
         pnl: Realised profit/loss in dollars.
     """
-    async with get_pool().acquire() as conn:
+    async with (await get_pool()).acquire() as conn:
         await conn.execute(
             """
             UPDATE trades
@@ -358,7 +360,7 @@ async def get_open_trades() -> list[dict[str, Any]]:
     Returns:
         List of trade dicts (all columns from ``trades``).
     """
-    async with get_pool().acquire() as conn:
+    async with (await get_pool()).acquire() as conn:
         rows = await conn.fetch(
             "SELECT * FROM trades WHERE status = 'open' ORDER BY opened_at DESC"
         )
@@ -374,7 +376,7 @@ async def get_recent_signals(limit: int = 20) -> list[dict[str, Any]]:
     Returns:
         List of signal dicts (all columns from ``signals``).
     """
-    async with get_pool().acquire() as conn:
+    async with (await get_pool()).acquire() as conn:
         rows = await conn.fetch(
             "SELECT * FROM signals ORDER BY created_at DESC LIMIT $1",
             limit,
@@ -402,7 +404,7 @@ async def get_latest_greeks(
         ``strike``, ``expiry``, and ``symbol`` from ``options_data``,
         or ``None`` if no matching row exists.
     """
-    async with get_pool().acquire() as conn:
+    async with (await get_pool()).acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT cg.*, od.option_type, od.strike, od.expiry, od.symbol
@@ -433,7 +435,7 @@ async def get_latest_options(symbol: str) -> list[dict[str, Any]]:
     Returns:
         List of option contract dicts, or an empty list if none exist.
     """
-    async with get_pool().acquire() as conn:
+    async with (await get_pool()).acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT *

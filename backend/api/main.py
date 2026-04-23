@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -77,13 +77,10 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    """Initialise the Alpaca client, database pool, and background fetcher.
-
-    Stores ``app.state.alpaca``, ``app.state.alpaca_connected``, and
-    ``app.state.fetcher_task``.  Failures in any individual step are logged
-    but do **not** abort startup — ``/health`` will reflect the real status.
-    """
+    """Initialise the Alpaca client, database pool, and background fetcher."""
     from backend.utils.config import settings
+
+    app.state.ready = False
 
     logger.info("APEX CRUSHER starting… version=%s", _VERSION)
     logger.info("Alpaca base URL: %s", settings.alpaca_base_url)
@@ -110,9 +107,13 @@ async def on_startup() -> None:
         logger.info("Database initialised.")
     except Exception as exc:
         logger.error("Database failed to initialise: %s", exc)
+        return  # don't mark ready if DB failed
 
     # ── Data fetcher ──────────────────────────────────────────────────────────
     app.state.fetcher_task = await start_fetcher()
+
+    app.state.ready = True
+    logger.info("APEX CRUSHER ready.")
 
 
 @app.on_event("shutdown")
@@ -124,6 +125,18 @@ async def on_shutdown() -> None:
         client.disconnect()
     await stop_fetcher()
     await close_db()
+
+
+# ── Dependencies ─────────────────────────────────────────────────────────────
+
+
+async def require_db(request: Request) -> None:
+    """Raise 503 if the database pool is not yet initialised."""
+    if not getattr(request.app.state, "ready", False):
+        raise HTTPException(
+            status_code=503,
+            detail="Service starting up, try again in a moment.",
+        )
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -159,7 +172,7 @@ async def api_status() -> dict[str, str]:
     }
 
 
-@app.get("/api/market-data/{symbol}", tags=["market"])
+@app.get("/api/market-data/{symbol}", tags=["market"], dependencies=[Depends(require_db)])
 async def market_data(symbol: str) -> dict[str, Any]:
     """Return the latest cached spot price for *symbol*.
 
@@ -179,7 +192,7 @@ async def market_data(symbol: str) -> dict[str, Any]:
     return data
 
 
-@app.get("/api/options/{symbol}", tags=["market"])
+@app.get("/api/options/{symbol}", tags=["market"], dependencies=[Depends(require_db)])
 async def options_chain(symbol: str) -> dict[str, Any]:
     """Return the most recent options chain snapshot for *symbol*.
 
@@ -200,7 +213,7 @@ async def options_chain(symbol: str) -> dict[str, Any]:
     }
 
 
-@app.get("/api/greeks/{symbol}/{strike}/{expiry}", tags=["market"])
+@app.get("/api/greeks/{symbol}/{strike}/{expiry}", tags=["market"], dependencies=[Depends(require_db)])
 async def greeks(symbol: str, strike: float, expiry: date) -> dict[str, Any]:
     """Return the most recently computed Greeks for a specific option contract.
 
@@ -222,7 +235,7 @@ async def greeks(symbol: str, strike: float, expiry: date) -> dict[str, Any]:
     return _serialize_row(row)
 
 
-@app.get("/api/pipeline/status", tags=["bot"])
+@app.get("/api/pipeline/status", tags=["bot"], dependencies=[Depends(require_db)])
 async def pipeline_status() -> dict[str, Any]:
     """Return the current state of the background data pipeline.
 
