@@ -102,18 +102,22 @@ async def on_startup() -> None:
     app.state.alpaca_connected = connected
 
     # ── Database ──────────────────────────────────────────────────────────────
+    logger.info("Starting database init...")
     try:
         await init_db()
-        logger.info("Database initialised.")
+        logger.info("Database ready.")
     except Exception as exc:
         logger.error("Database failed to initialise: %s", exc)
-        return  # don't mark ready if DB failed
+        logger.error(traceback.format_exc())
+        raise
 
     # ── Data fetcher ──────────────────────────────────────────────────────────
+    logger.info("Starting fetcher...")
     app.state.fetcher_task = await start_fetcher()
+    logger.info("Fetcher started.")
 
     app.state.ready = True
-    logger.info("APEX CRUSHER ready.")
+    logger.info("App ready — accepting requests. app.state.ready = True")
 
 
 @app.on_event("shutdown")
