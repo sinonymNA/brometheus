@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+alpaca-trade-api
+alpaca-py
+pandas
+numpy
+scipy
+python-dotenv
+redis
+asyncpg
+sqlalchemy[asyncio]
+websockets
+aiohttp
+pytest
+pytest-asyncio
+httpx
