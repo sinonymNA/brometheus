@@ -5,6 +5,7 @@ alpaca-py
 pytz
 pandas
 numpy
+ta
 scipy
 python-dotenv
 redis
