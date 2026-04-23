@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend.data.alpaca_client import AlpacaClient
+from backend.data.storage import close_db, init_db
 from backend.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -92,14 +93,22 @@ async def on_startup() -> None:
     app.state.alpaca = client
     app.state.alpaca_connected = connected
 
+    # ── Database ──────────────────────────────────────────────────────────────
+    try:
+        await init_db()
+        logger.info("Database initialised.")
+    except Exception as exc:
+        logger.error("Database failed to initialise: %s", exc)
+
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
-    """Disconnect the Alpaca client and log shutdown."""
+    """Disconnect the Alpaca client, close the DB pool, and log shutdown."""
     logger.info("APEX CRUSHER shutting down…")
     client: AlpacaClient | None = getattr(app.state, "alpaca", None)
     if client is not None:
         client.disconnect()
+    await close_db()
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
