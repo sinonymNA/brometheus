@@ -112,24 +112,32 @@ class IVRankStrategy(BaseStrategy):
                 "strike": short_call["strike"],
                 "expiry": short_call["expiry"],
                 "option_type": "call",
+                "bid": short_call["bid"],
+                "ask": short_call["ask"],
             },
             {
                 "action": "buy",
                 "strike": long_call["strike"],   # type: ignore[index]
                 "expiry": long_call["expiry"],   # type: ignore[index]
                 "option_type": "call",
+                "bid": long_call["bid"],         # type: ignore[index]
+                "ask": long_call["ask"],         # type: ignore[index]
             },
             {
                 "action": "sell",
                 "strike": short_put["strike"],   # type: ignore[index]
                 "expiry": short_put["expiry"],   # type: ignore[index]
                 "option_type": "put",
+                "bid": short_put["bid"],         # type: ignore[index]
+                "ask": short_put["ask"],         # type: ignore[index]
             },
             {
                 "action": "buy",
                 "strike": long_put["strike"],    # type: ignore[index]
                 "expiry": long_put["expiry"],    # type: ignore[index]
                 "option_type": "put",
+                "bid": long_put["bid"],          # type: ignore[index]
+                "ask": long_put["ask"],          # type: ignore[index]
             },
         ]
 

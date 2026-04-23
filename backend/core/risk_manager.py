@@ -281,7 +281,7 @@ class RiskManager:
         except Exception as exc:
             logger.error("Failed to set emergency stop in Redis: %s", exc)
 
-    async def clear_emergency_stop(self) -> None:
+    async def reset_emergency_stop(self) -> None:
         """Remove the Redis emergency-stop flag, re-enabling trading."""
         try:
             from backend.data.fetcher import _get_redis
@@ -306,15 +306,17 @@ class RiskManager:
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
-    async def _is_emergency_stopped(self) -> bool:
-        """Return ``True`` if the emergency-stop key exists in Redis."""
+    async def is_emergency_stopped(self) -> bool:
+        """Return ``True`` if the emergency-stop key is set in Redis."""
         try:
             from backend.data.fetcher import _get_redis
             redis = await _get_redis()
             return await redis.get(_EMERGENCY_STOP_KEY) is not None
         except Exception:
-            # If Redis is unreachable, don't block trading on an unavailable flag.
             return False
+
+    # keep private alias for internal use
+    _is_emergency_stopped = is_emergency_stopped
 
     async def _count_open_trades(self) -> int:
         """Return the number of currently open trades from the database."""

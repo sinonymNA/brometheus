@@ -325,29 +325,36 @@ async def save_trade(trade: dict[str, Any]) -> int:
     return row["id"]
 
 
-async def update_trade_closed(trade_id: int, exit_price: float, pnl: float) -> None:
-    """Mark a trade as closed and record its exit price and PnL.
+async def update_trade_closed(
+    trade_id: int,
+    exit_price: float,
+    pnl: float,
+    close_reason: str | None = None,
+) -> None:
+    """Mark a trade as closed and record its exit price, PnL, and reason.
 
     Args:
         trade_id: Primary key of the trade to close.
         exit_price: Fill price of the closing order.
         pnl: Realised profit/loss in dollars.
+        close_reason: Optional human-readable reason (e.g. ``"profit target"``).
     """
     async with (await get_pool()).acquire() as conn:
         await conn.execute(
             """
             UPDATE trades
-            SET exit_price = $1,
-                pnl        = $2,
-                status     = 'closed',
-                closed_at  = NOW()
+            SET exit_price   = $1,
+                pnl          = $2,
+                status       = 'closed',
+                closed_at    = NOW(),
+                close_reason = $4
             WHERE id = $3
             """,
-            exit_price, pnl, trade_id,
+            exit_price, pnl, trade_id, close_reason,
         )
     logger.info(
-        "Trade closed: id=%d  exit=%.2f  pnl=%+.2f",
-        trade_id, exit_price, pnl,
+        "Trade closed: id=%d  exit=%.2f  pnl=%+.2f  reason=%s",
+        trade_id, exit_price, pnl, close_reason or "—",
     )
 
 
@@ -421,6 +428,35 @@ async def get_latest_greeks(
             expiry,
         )
     return dict(row) if row is not None else None
+
+
+async def get_trade_by_id(trade_id: int) -> dict[str, Any] | None:
+    """Return a single trade row by primary key, or ``None`` if not found."""
+    async with (await get_pool()).acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM trades WHERE id = $1", trade_id)
+    return dict(row) if row is not None else None
+
+
+async def get_closed_trades(limit: int = 100) -> list[dict[str, Any]]:
+    """Return the most recent closed trades, newest first.
+
+    Args:
+        limit: Maximum rows to return. Default 100.
+
+    Returns:
+        List of trade dicts with all ``trades`` columns.
+    """
+    async with (await get_pool()).acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM trades
+            WHERE  status = 'closed'
+            ORDER  BY closed_at DESC
+            LIMIT  $1
+            """,
+            limit,
+        )
+    return [dict(r) for r in rows]
 
 
 async def get_latest_options(symbol: str) -> list[dict[str, Any]]:

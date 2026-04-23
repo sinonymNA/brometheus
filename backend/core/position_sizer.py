@@ -74,23 +74,27 @@ class PositionSizer:
 
     async def calculate(
         self,
-        account_equity: float,
+        strength: float,
         option_price: float,
+        account_equity: float,
+        daily_pnl: float = 0.0,
     ) -> SizeResult:
         """Size a position in five steps using the half-Kelly criterion.
 
         **Step 1** — Retrieve trade statistics (win rate, avg win/loss).
         **Step 2** — Compute the raw Kelly fraction f* = (b·p − q) / b,
                      where b = avg_win/avg_loss, p = win_rate, q = 1 − p.
-        **Step 3** — Apply half-Kelly (f* × 0.5) and cap at
+        **Step 3** — Apply half-Kelly × *strength*, cap at
                      :data:`MAX_RISK_PER_TRADE_PCT`.
         **Step 4** — Dollar risk = equity × capped Kelly fraction.
         **Step 5** — Contracts = floor(dollar_risk / (option_price × 100)),
                      capped at :data:`MAX_CONTRACTS`.
 
         Args:
-            account_equity: Current account equity in dollars.
+            strength: Signal strength ∈ [0, 1]; scales the Kelly fraction.
             option_price: Per-share mid-price of the option contract.
+            account_equity: Current account equity in dollars.
+            daily_pnl: Today's realised + unrealised PnL (informational).
 
         Returns:
             :class:`SizeResult` with the recommended contract count and
@@ -135,8 +139,9 @@ class PositionSizer:
         b = avg_win / avg_loss if avg_loss > 0 else 1.0
         kelly_raw = (b * win_rate - lose_rate) / b
 
-        # Step 3: Half-Kelly, floored at 0, capped at max risk.
-        kelly_fraction = max(0.0, min(kelly_raw * 0.5, MAX_RISK_PER_TRADE_PCT))
+        # Step 3: Half-Kelly × signal strength, floored at 0, capped at max risk.
+        signal_strength = max(0.0, min(float(strength), 1.0))
+        kelly_fraction = max(0.0, min(kelly_raw * 0.5 * signal_strength, MAX_RISK_PER_TRADE_PCT))
 
         if kelly_fraction == 0.0:
             return SizeResult(

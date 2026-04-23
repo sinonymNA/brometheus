@@ -98,6 +98,10 @@ CREATE TABLE IF NOT EXISTS trades (
     closed_at     TIMESTAMPTZ
 );
 
+-- close_reason and metadata added after initial schema; idempotent.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_reason VARCHAR(50);
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS metadata JSONB;
+
 CREATE INDEX IF NOT EXISTS idx_trades_status
     ON trades (status);
 
