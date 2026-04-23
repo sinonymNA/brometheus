@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import math
+import os
 import statistics
 import traceback
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from backend.data.alpaca_client import AlpacaClient
 from backend.data.fetcher import (
@@ -51,6 +55,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── WebSocket manager ─────────────────────────────────────────────────────────
+
+_MAX_WS = 10
+
+
+class _WSManager:
+    def __init__(self) -> None:
+        self._clients: set[WebSocket] = set()
+
+    async def connect(self, ws: WebSocket) -> bool:
+        if len(self._clients) >= _MAX_WS:
+            await ws.close(code=1008, reason="Max connections reached")
+            return False
+        await ws.accept()
+        self._clients.add(ws)
+        logger.debug("WebSocket client connected (%d total).", len(self._clients))
+        return True
+
+    def disconnect(self, ws: WebSocket) -> None:
+        self._clients.discard(ws)
+        logger.debug("WebSocket client disconnected (%d remaining).", len(self._clients))
+
+    @property
+    def count(self) -> int:
+        return len(self._clients)
+
+
+_ws_manager = _WSManager()
+
 # ── Error handling ────────────────────────────────────────────────────────────
 
 
@@ -80,7 +113,7 @@ async def on_startup() -> None:
     logger.info("APEX CRUSHER starting… version=%s", _VERSION)
     logger.info("Alpaca base URL: %s", settings.alpaca_base_url)
 
-    # b. Database
+    # Database — hard dependency, raise if it fails
     try:
         await init_db()
         logger.info("Database ready.")
@@ -89,7 +122,7 @@ async def on_startup() -> None:
         logger.error(traceback.format_exc())
         raise
 
-    # c. Alpaca client
+    # Alpaca client
     client = AlpacaClient()
     connected = False
     try:
@@ -105,14 +138,14 @@ async def on_startup() -> None:
     app.state.alpaca = client
     app.state.alpaca_connected = connected
 
-    # d. Data fetcher
+    # Data fetcher
     try:
         app.state.fetcher_task = await start_fetcher()
         logger.info("Fetcher started.")
     except Exception as exc:
         logger.error("Fetcher failed to start: %s", exc)
 
-    # e. Strategy runner
+    # Strategy runner + risk manager
     try:
         from backend.core.risk_manager import RiskManager
         from backend.core.strategy_runner import StrategyRunner
@@ -123,7 +156,6 @@ async def on_startup() -> None:
         logger.info("StrategyRunner started.")
     except Exception as exc:
         logger.error("StrategyRunner failed to start: %s", exc, exc_info=True)
-        # Ensure risk_manager is always available even if StrategyRunner failed
         try:
             from backend.core.risk_manager import RiskManager as _RM
             if app.state.risk_manager is None:
@@ -131,7 +163,6 @@ async def on_startup() -> None:
         except Exception:
             pass
 
-    # g. Mark ready
     app.state.ready = True
     logger.info("APEX CRUSHER IS LIVE")
 
@@ -139,15 +170,12 @@ async def on_startup() -> None:
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     logger.info("APEX CRUSHER shutting down…")
-
     runner: Any = getattr(app.state, "strategy_runner", None)
     if runner is not None:
         await runner.stop()
-
     client: AlpacaClient | None = getattr(app.state, "alpaca", None)
     if client is not None:
         client.disconnect()
-
     await stop_fetcher()
     await close_db()
 
@@ -157,18 +185,14 @@ async def on_shutdown() -> None:
 
 async def require_ready(request: Request) -> None:
     if not getattr(request.app.state, "ready", False):
-        raise HTTPException(
-            status_code=503,
-            detail="Service starting up, try again in a moment.",
-        )
+        raise HTTPException(status_code=503, detail="Service starting up, try again in a moment.")
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── HTTP Routes ───────────────────────────────────────────────────────────────
 
 
 @app.get("/health", tags=["meta"])
 async def health() -> dict[str, Any]:
-    """Return service liveness and dependency health."""
     from backend.data.storage import get_pool
     db_ok = False
     try:
@@ -196,7 +220,6 @@ async def health() -> dict[str, Any]:
 
 @app.get("/api/status", tags=["bot"])
 async def api_status() -> dict[str, Any]:
-    """Return the current operational status of the trading bot."""
     runner = getattr(app.state, "strategy_runner", None)
     rm = getattr(app.state, "risk_manager", None)
     emergency_stopped = False
@@ -205,7 +228,6 @@ async def api_status() -> dict[str, Any]:
             emergency_stopped = await rm.is_emergency_stopped()
         except Exception:
             pass
-
     return {
         "bot_running": runner.is_running if runner is not None else False,
         "ready": getattr(app.state, "ready", False),
@@ -217,7 +239,6 @@ async def api_status() -> dict[str, Any]:
 
 @app.get("/api/pipeline/status", tags=["bot"], dependencies=[Depends(require_ready)])
 async def pipeline_status() -> dict[str, Any]:
-    """Return the current state of the background data pipeline."""
     state = get_pipeline_state()
     redis_ok = await _redis_ping()
     return {
@@ -231,47 +252,31 @@ async def pipeline_status() -> dict[str, Any]:
 
 @app.get("/api/market-data/{symbol}", tags=["market"], dependencies=[Depends(require_ready)])
 async def market_data(symbol: str) -> dict[str, Any]:
-    """Return the latest cached spot price for *symbol*."""
     upper = symbol.upper()
     data = await get_cached_market_data(upper)
     if data is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No cached price for {upper}. The fetcher may not have run yet.",
-        )
+        raise HTTPException(status_code=404, detail=f"No cached price for {upper}.")
     return data
 
 
 @app.get("/api/options/{symbol}", tags=["market"], dependencies=[Depends(require_ready)])
 async def options_chain(symbol: str) -> dict[str, Any]:
-    """Return the most recent options chain snapshot for *symbol* (max 100 contracts)."""
     upper = symbol.upper()
     rows = await get_latest_options(upper)
-    serialized = [_ser(dict(r)) for r in rows[:100]]
-    return {
-        "symbol": upper,
-        "count": len(serialized),
-        "contracts": serialized,
-        "timestamp": _utc_now(),
-    }
+    return {"symbol": upper, "count": len(rows[:100]), "contracts": [_ser(dict(r)) for r in rows[:100]], "timestamp": _utc_now()}
 
 
 @app.get("/api/greeks/{symbol}/{strike}/{expiry}", tags=["market"], dependencies=[Depends(require_ready)])
 async def greeks(symbol: str, strike: float, expiry: date) -> dict[str, Any]:
-    """Return the most recently computed Greeks for a specific option contract."""
     upper = symbol.upper()
     row = await get_latest_greeks(upper, strike, expiry)
     if row is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No Greeks found for {upper} K={strike} exp={expiry}.",
-        )
+        raise HTTPException(status_code=404, detail=f"No Greeks for {upper} K={strike} exp={expiry}.")
     return _ser(dict(row))
 
 
 @app.get("/api/signals/recent", tags=["trading"], dependencies=[Depends(require_ready)])
 async def signals_recent() -> dict[str, Any]:
-    """Return the last 50 signals saved to the database."""
     from backend.data.storage import get_pool
     rows: list[dict[str, Any]] = []
     try:
@@ -279,8 +284,8 @@ async def signals_recent() -> dict[str, Any]:
         async with pool.acquire() as conn:
             records = await conn.fetch(
                 """
-                SELECT id, symbol, signal_type, direction, strength, strategy,
-                       created_at, metadata
+                SELECT id, symbol, signal_type, direction, strength, strategy_name,
+                       created_at, acted_on, metadata
                 FROM   signals
                 ORDER  BY created_at DESC
                 LIMIT  50
@@ -289,68 +294,47 @@ async def signals_recent() -> dict[str, Any]:
         rows = [_ser(dict(r)) for r in records]
     except Exception as exc:
         logger.warning("signals_recent query failed: %s", exc)
-
     return {"count": len(rows), "signals": rows, "timestamp": _utc_now()}
 
 
 @app.get("/api/trades/open", tags=["trading"], dependencies=[Depends(require_ready)])
 async def trades_open() -> dict[str, Any]:
-    """Return all currently open trades enriched with unrealised PnL and DTE."""
     from backend.data.storage import get_open_trades
     from backend.data.fetcher import get_cached_price
-
     raw = await get_open_trades()
     enriched: list[dict[str, Any]] = []
     today = date.today()
-
     for trade in raw:
         t = _ser(dict(trade))
-
-        # Unrealised PnL
         cached = await get_cached_price(t["symbol"])
         entry = trade.get("entry_price")
         qty = trade.get("quantity", 0)
         if cached is not None and entry is not None and qty:
             direction = 1 if str(trade.get("action", "buy")).lower() == "buy" else -1
             t["current_price"] = cached
-            t["unrealized_pnl"] = round(
-                direction * (cached - float(entry)) * qty * 100, 2
-            )
+            t["unrealized_pnl"] = round(direction * (cached - float(entry)) * qty * 100, 2)
         else:
             t["current_price"] = None
             t["unrealized_pnl"] = None
-
-        # DTE
         expiry_val = trade.get("expiry")
-        if isinstance(expiry_val, date):
-            t["dte"] = (expiry_val - today).days
-        else:
-            t["dte"] = None
-
+        t["dte"] = (expiry_val - today).days if isinstance(expiry_val, date) else None
         enriched.append(t)
-
     return {"count": len(enriched), "trades": enriched, "timestamp": _utc_now()}
 
 
 @app.get("/api/trades/history", tags=["trading"], dependencies=[Depends(require_ready)])
 async def trades_history() -> dict[str, Any]:
-    """Return the last 100 closed trades with duration, PnL%, and close reason."""
     from backend.data.storage import get_closed_trades
-
     raw = await get_closed_trades(limit=100)
     result: list[dict[str, Any]] = []
-
     for trade in raw:
         t = _ser(dict(trade))
-
         opened_at = trade.get("opened_at")
         closed_at = trade.get("closed_at")
         if isinstance(opened_at, datetime) and isinstance(closed_at, datetime):
-            delta = closed_at - opened_at
-            t["duration_minutes"] = round(delta.total_seconds() / 60, 1)
+            t["duration_minutes"] = round((closed_at - opened_at).total_seconds() / 60, 1)
         else:
             t["duration_minutes"] = None
-
         entry = trade.get("entry_price")
         pnl = trade.get("pnl")
         qty = trade.get("quantity", 1)
@@ -359,27 +343,21 @@ async def trades_history() -> dict[str, Any]:
             t["pnl_pct"] = round(float(pnl) / cost_basis * 100, 2) if cost_basis else None
         else:
             t["pnl_pct"] = None
-
         t.setdefault("close_reason", None)
         result.append(t)
-
     return {"count": len(result), "trades": result, "timestamp": _utc_now()}
 
 
 @app.get("/api/performance", tags=["trading"], dependencies=[Depends(require_ready)])
 async def performance() -> dict[str, Any]:
-    """Return aggregate performance metrics for the bot."""
     from backend.data.storage import get_pool
+    from backend.core.risk_manager import STARTING_BALANCE
 
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """
-            SELECT pnl, closed_at::date AS trade_date
-            FROM   trades
-            WHERE  status = 'closed' AND pnl IS NOT NULL
-            ORDER  BY closed_at DESC
-            """,
+            "SELECT pnl, closed_at::date AS trade_date FROM trades "
+            "WHERE status = 'closed' AND pnl IS NOT NULL ORDER BY closed_at DESC",
         )
 
     pnls = [float(r["pnl"]) for r in rows]
@@ -390,55 +368,45 @@ async def performance() -> dict[str, Any]:
     win_rate = round(len(wins) / len(pnls), 4) if pnls else 0.0
     avg_win = round(sum(wins) / len(wins), 2) if wins else 0.0
     avg_loss = round(sum(losses) / len(losses), 2) if losses else 0.0
-    gross_profit = sum(wins)
     gross_loss = abs(sum(losses))
-    profit_factor = round(gross_profit / gross_loss, 4) if gross_loss else None
+    profit_factor = round(sum(wins) / gross_loss, 4) if gross_loss else None
     best_trade = round(max(pnls), 2) if pnls else None
     worst_trade = round(min(pnls), 2) if pnls else None
 
-    # Daily PnL bucketing for Sharpe
     daily: dict[Any, float] = {}
     for r in rows:
         d = r["trade_date"]
         daily[d] = daily.get(d, 0.0) + float(r["pnl"])
-    daily_pnls = list(daily.values())
     sharpe: float | None = None
-    if len(daily_pnls) >= 2:
+    if len(daily) >= 2:
         try:
-            mu = statistics.mean(daily_pnls)
-            sigma = statistics.stdev(daily_pnls)
+            mu = statistics.mean(daily.values())
+            sigma = statistics.stdev(daily.values())
             sharpe = round(mu / sigma * math.sqrt(252), 4) if sigma else None
         except Exception:
             pass
 
-    # Monthly PnL (current calendar month)
-    from backend.data.storage import get_pool as _gp  # already imported above
     today = date.today()
     monthly_pnl: float = 0.0
     try:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
-                SELECT COALESCE(SUM(pnl), 0) AS total
-                FROM   trades
-                WHERE  status = 'closed'
-                  AND  pnl IS NOT NULL
-                  AND  DATE_TRUNC('month', closed_at) = DATE_TRUNC('month', $1::date)
-                """,
+                "SELECT COALESCE(SUM(pnl), 0) AS total FROM trades "
+                "WHERE status = 'closed' AND pnl IS NOT NULL "
+                "AND DATE_TRUNC('month', closed_at) = DATE_TRUNC('month', $1::date)",
                 today,
             )
         monthly_pnl = round(float(row["total"] or 0.0), 2)
     except Exception as exc:
         logger.warning("monthly_pnl query failed: %s", exc)
 
-    # Current drawdown vs starting balance
-    from backend.core.risk_manager import STARTING_BALANCE
+    equity = STARTING_BALANCE
     try:
         alpaca: AlpacaClient = app.state.alpaca
         account = await alpaca.get_account()
-        equity = float(account.get("equity", STARTING_BALANCE))
+        equity = float(account.equity)
     except Exception:
-        equity = STARTING_BALANCE
+        pass
     drawdown_pct = round(max(0.0, (STARTING_BALANCE - equity) / STARTING_BALANCE), 4)
 
     return {
@@ -459,7 +427,6 @@ async def performance() -> dict[str, Any]:
 
 @app.post("/api/emergency-stop", tags=["control"], dependencies=[Depends(require_ready)])
 async def emergency_stop() -> dict[str, Any]:
-    """Activate the emergency stop flag, halting all new trade execution."""
     rm = app.state.risk_manager
     await rm.emergency_stop()
     return {"status": "emergency_stop_activated", "timestamp": _utc_now()}
@@ -467,10 +434,211 @@ async def emergency_stop() -> dict[str, Any]:
 
 @app.post("/api/resume", tags=["control"], dependencies=[Depends(require_ready)])
 async def resume() -> dict[str, Any]:
-    """Clear the emergency stop flag, re-enabling trade execution."""
     rm = app.state.risk_manager
     await rm.reset_emergency_stop()
     return {"status": "trading_resumed", "timestamp": _utc_now()}
+
+
+# ── WebSocket ─────────────────────────────────────────────────────────────────
+
+
+@app.websocket("/ws")
+async def websocket_handler(ws: WebSocket) -> None:
+    if not await _ws_manager.connect(ws):
+        return
+    ping_tick = 0
+    try:
+        while True:
+            payload = await _build_ws_payload()
+            await ws.send_text(json.dumps(payload, default=str))
+            ping_tick += 1
+            if ping_tick >= 15:
+                await ws.send_text('{"type":"ping"}')
+                ping_tick = 0
+            try:
+                await asyncio.wait_for(ws.receive_text(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.debug("WebSocket error: %s", exc)
+    finally:
+        _ws_manager.disconnect(ws)
+
+
+async def _build_ws_payload() -> dict[str, Any]:
+    from backend.core.risk_manager import STARTING_BALANCE
+
+    payload: dict[str, Any] = {
+        "type": "update",
+        "balance": STARTING_BALANCE,
+        "daily_pnl": 0.0,
+        "market_open": False,
+        "bot_running": False,
+        "emergency_stop": False,
+        "open_positions": [],
+        "recent_signals": [],
+        "portfolio_greeks": {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0},
+        "equity_curve": [],
+        "pipeline_state": {},
+        "uptime_seconds": round((datetime.now(timezone.utc) - _START_TIME).total_seconds(), 1),
+        "timestamp": _utc_now(),
+    }
+
+    rm = getattr(app.state, "risk_manager", None)
+    runner = getattr(app.state, "strategy_runner", None)
+    if rm is not None:
+        payload["market_open"] = rm.is_market_open()
+        try:
+            payload["emergency_stop"] = await rm.is_emergency_stopped()
+        except Exception:
+            pass
+    if runner is not None:
+        payload["bot_running"] = runner.is_running
+
+    payload["pipeline_state"] = get_pipeline_state()
+
+    # Account balance + daily PnL
+    balance = STARTING_BALANCE
+    try:
+        alpaca = getattr(app.state, "alpaca", None)
+        if alpaca is not None:
+            account = await alpaca.get_account()
+            balance = float(account.equity)
+            payload["balance"] = balance
+    except Exception:
+        pass
+    try:
+        if rm is not None:
+            payload["daily_pnl"] = round(await rm.get_daily_pnl(balance), 2)
+    except Exception:
+        pass
+
+    # Open positions enriched with current price + DTE
+    try:
+        from backend.data.storage import get_open_trades
+        from backend.data.fetcher import get_cached_price
+        trades = await get_open_trades()
+        positions = []
+        today = date.today()
+        for t in trades:
+            current = await get_cached_price(t["symbol"])
+            entry = float(t.get("entry_price") or 0)
+            qty = int(t.get("quantity") or 0)
+            direction = 1 if str(t.get("action", "buy")).lower() == "buy" else -1
+            upnl = round(direction * (current - entry) * qty * 100, 2) if current else None
+            exp = t.get("expiry")
+            positions.append({
+                "id": t.get("id"),
+                "symbol": t["symbol"],
+                "strike": float(t.get("strike") or 0),
+                "option_type": t.get("option_type", ""),
+                "strategy": t.get("strategy", ""),
+                "action": t.get("action", ""),
+                "entry_price": entry,
+                "current_price": current,
+                "quantity": qty,
+                "unrealized_pnl": upnl,
+                "dte": (exp - today).days if isinstance(exp, date) else None,
+                "expiry": exp.isoformat() if isinstance(exp, date) else None,
+                "opened_at": t["opened_at"].strftime("%Y-%m-%dT%H:%M:%SZ") if hasattr(t.get("opened_at"), "strftime") else None,
+            })
+        payload["open_positions"] = positions
+    except Exception as exc:
+        logger.debug("WS open_positions error: %s", exc)
+
+    # Recent signals (last 10)
+    try:
+        from backend.data.storage import get_pool
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, symbol, signal_type, direction, strength, strategy_name, "
+                "created_at, acted_on FROM signals ORDER BY created_at DESC LIMIT 10",
+            )
+        payload["recent_signals"] = [
+            {
+                "id": r["id"],
+                "symbol": r["symbol"],
+                "signal_type": r["signal_type"],
+                "direction": r["direction"],
+                "strength": float(r["strength"] or 0),
+                "strategy": r["strategy_name"],
+                "acted_on": r["acted_on"],
+                "timestamp": r["created_at"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            for r in rows
+        ]
+    except Exception as exc:
+        logger.debug("WS recent_signals error: %s", exc)
+
+    # Portfolio Greeks (net exposure across open trades)
+    try:
+        from backend.data.storage import get_pool
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT t.quantity, t.action,
+                       cg.delta, cg.gamma, cg.vega, cg.theta, cg.rho
+                FROM   trades t
+                JOIN   LATERAL (
+                    SELECT cg2.delta, cg2.gamma, cg2.vega, cg2.theta, cg2.rho
+                    FROM   options_data od
+                    JOIN   calculated_greeks cg2 ON cg2.option_id = od.id
+                    WHERE  od.symbol      = t.symbol
+                      AND  od.strike      = t.strike
+                      AND  od.expiry      = t.expiry
+                      AND  od.option_type = t.option_type
+                    ORDER  BY cg2.timestamp DESC
+                    LIMIT  1
+                ) cg ON TRUE
+                WHERE  t.status = 'open'
+                  AND  t.strike IS NOT NULL
+                  AND  t.expiry IS NOT NULL
+                  AND  t.option_type IS NOT NULL
+                """,
+            )
+        net: dict[str, float] = {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
+        for r in rows:
+            qty = int(r["quantity"] or 0)
+            sign = (1 if str(r.get("action", "buy")).lower() == "buy" else -1) * qty * 100
+            for g in net:
+                net[g] += float(r[g] or 0) * sign
+        payload["portfolio_greeks"] = {k: round(v, 4) for k, v in net.items()}
+    except Exception as exc:
+        logger.debug("WS portfolio_greeks error: %s", exc)
+
+    # Equity curve — running balance from trade history (last 60 days)
+    try:
+        from backend.data.storage import get_pool
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH daily AS (
+                    SELECT closed_at::date AS d, SUM(pnl) AS dpnl
+                    FROM   trades
+                    WHERE  status = 'closed' AND pnl IS NOT NULL
+                    GROUP  BY 1
+                    ORDER  BY 1
+                )
+                SELECT d, $1::float + SUM(dpnl) OVER (ORDER BY d) AS balance
+                FROM   daily
+                WHERE  d >= CURRENT_DATE - INTERVAL '60 days'
+                ORDER  BY d
+                """,
+                STARTING_BALANCE,
+            )
+        payload["equity_curve"] = [
+            {"date": r["d"].isoformat(), "balance": round(float(r["balance"]), 2)}
+            for r in rows
+        ]
+    except Exception as exc:
+        logger.debug("WS equity_curve error: %s", exc)
+
+    return payload
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -481,7 +649,6 @@ def _utc_now() -> str:
 
 
 def _ser(row: dict[str, Any]) -> dict[str, Any]:
-    """Convert asyncpg types to JSON-serialisable primitives."""
     out: dict[str, Any] = {}
     for key, val in row.items():
         if isinstance(val, Decimal):
@@ -506,7 +673,6 @@ async def _redis_ping() -> bool:
 
 
 async def _opt_mid(symbol: str) -> float | None:
-    """Return the mid-price of the best ATM option for *symbol*, or None."""
     try:
         from backend.data.fetcher import get_cached_price
         from backend.data.storage import get_pool
@@ -516,14 +682,10 @@ async def _opt_mid(symbol: str) -> float | None:
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
-                SELECT bid, ask
-                FROM   options_data
-                WHERE  symbol = $1 AND bid > 0 AND ask > 0
-                  AND  timestamp = (SELECT MAX(timestamp) FROM options_data WHERE symbol = $1)
-                ORDER  BY ABS(strike - $2) ASC
-                LIMIT  1
-                """,
+                "SELECT bid, ask FROM options_data "
+                "WHERE symbol=$1 AND bid>0 AND ask>0 "
+                "AND timestamp=(SELECT MAX(timestamp) FROM options_data WHERE symbol=$1) "
+                "ORDER BY ABS(strike-$2) ASC LIMIT 1",
                 symbol, spot,
             )
         if row is None:
@@ -531,3 +693,10 @@ async def _opt_mid(symbol: str) -> float | None:
         return round((float(row["bid"]) + float(row["ask"])) / 2, 4)
     except Exception:
         return None
+
+
+# ── Static frontend (must be last) ────────────────────────────────────────────
+
+_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "frontend", "dist")
+if os.path.isdir(_DIST):
+    app.mount("/", StaticFiles(directory=_DIST, html=True), name="frontend")
