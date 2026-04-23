@@ -81,26 +81,13 @@ class HistoricalDataLoader:
             end_date,
             timeframe,
         )
-        bars_result = await self._alpaca.get_bars(
+        # alpaca_client.get_bars returns dict[str, list[Bar]] already
+        bars: dict[str, list[Any]] = await self._alpaca.get_bars(
             symbols, timeframe, start_date, end_date
         )
 
-        # Convert BarSet (or dict) to plain dict for reliable pickling
-        bars: dict[str, list[Any]] = {}
-        try:
-            # Try dict-like access (works for dict and BarSet)
-            if hasattr(bars_result, 'items'):
-                for symbol, bar_list in bars_result.items():
-                    bars[symbol] = list(bar_list)
-            else:
-                # Fallback: assume it's already dict-like
-                bars = dict(bars_result)
-        except Exception as e:
-            logger.warning("Failed to convert bars to dict: %s. Using as-is", e)
-            bars = bars_result
-
-        logger.info("Loaded %d symbols with %d total bars",
-                   len(bars), sum(len(b) for b in bars.values() if isinstance(b, list)))
+        logger.info("Fetched %d symbols, %d total bars",
+                   len(bars), sum(len(b) for b in bars.values()))
 
         with cache_file.open("wb") as fh:
             pickle.dump(bars, fh)

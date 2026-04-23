@@ -292,6 +292,11 @@ class AlpacaClient:
             start = now - timedelta(days=30)
         if end is None:
             end = now
+        # Accept date objects — convert to UTC midnight datetime
+        if isinstance(start, date) and not isinstance(start, datetime):
+            start = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+        if isinstance(end, date) and not isinstance(end, datetime):
+            end = datetime(end.year, end.month, end.day, 23, 59, 59, tzinfo=timezone.utc)
 
         req = StockBarsRequest(
             symbol_or_symbols=symbols,
@@ -300,28 +305,28 @@ class AlpacaClient:
             end=end,
         )
         raw = await self._call(self._stock_client.get_stock_bars, req)
-        # BarSet is dict-like but may be a Pydantic model; handle both cases
-        result: dict[str, list[Bar]] = {}
-        try:
-            # Try dict-like access first (.items() method)
-            if hasattr(raw, 'items') and callable(getattr(raw, 'items', None)):
-                result = {sym: list(bars) for sym, bars in raw.items()}
-            else:
-                # Fallback: iterate over BarSet directly or use __iter__
-                for symbol in symbols:
-                    if symbol in raw:
-                        result[symbol] = list(raw[symbol])
-                    elif hasattr(raw, symbol):
-                        result[symbol] = list(getattr(raw, symbol))
-        except Exception as e:
-            logger.warning("Failed to convert BarSet with standard method: %s. Trying dict()", e)
-            try:
-                result = dict(raw)
-            except Exception as e2:
-                logger.error("Failed to convert BarSet: %s", e2)
-                raise
+
+        # alpaca-py returns a BarSet Pydantic model.
+        # BarSet.data is Dict[str, List[Bar]] — the actual dict.
+        # BarSet also supports __iter__ (yields symbol keys) and __getitem__.
+        if hasattr(raw, 'data') and isinstance(raw.data, dict):
+            result: dict[str, list[Bar]] = {sym: list(bars) for sym, bars in raw.data.items()}
+        elif hasattr(raw, '__iter__'):
+            # Fallback: iterate symbol keys, index by symbol
+            result = {}
+            for sym in raw:
+                try:
+                    result[sym] = list(raw[sym])
+                except Exception:
+                    pass
+        else:
+            raise RuntimeError(
+                f"Unexpected return type from get_stock_bars: {type(raw).__name__}. "
+                f"attrs: {[a for a in dir(raw) if not a.startswith('_')]}"
+            )
+
         logger.debug("Fetched %d symbols with %d total bars for timeframe %s",
-                    len(result), sum(len(bars) for bars in result.values()), timeframe)
+                    len(result), sum(len(b) for b in result.values()), timeframe)
         return result
 
     # ── Order placement ───────────────────────────────────────────────────────
