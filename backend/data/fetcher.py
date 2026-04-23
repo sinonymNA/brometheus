@@ -62,25 +62,31 @@ _OCC_RE = re.compile(r"^([A-Z]{1,5})(\d{6})([CP])(\d{8})$")
 
 _task: asyncio.Task[None] | None = None
 _redis: aioredis.Redis | None = None  # type: ignore[type-arg]
+_last_cycle_at: datetime | None = None
+_total_options_priced: int = 0
 
 
 # ── Public lifecycle ──────────────────────────────────────────────────────────
 
 
-async def start() -> None:
+async def start() -> "asyncio.Task[None]":
     """Launch the fetch loop as a named asyncio background task.
 
     No-op if the task is already running.  Intended to be called from the
     FastAPI ``on_startup`` handler after :func:`~backend.data.storage.init_db`
     and :meth:`~backend.data.alpaca_client.AlpacaClient.connect` have
     completed.
+
+    Returns:
+        The background :class:`asyncio.Task` (already running).
     """
     global _task
     if _task is not None and not _task.done():
         logger.warning("Fetcher is already running; ignoring duplicate start().")
-        return
+        return _task
     _task = asyncio.create_task(_loop(), name="apex-fetcher")
     logger.info("Fetcher started (cycle=%ds, symbols=%s).", _CYCLE_SECS, SYMBOLS)
+    return _task
 
 
 async def stop() -> None:
@@ -125,6 +131,9 @@ async def _loop() -> None:
 
         try:
             n = await run_cycle()
+            global _last_cycle_at, _total_options_priced
+            _last_cycle_at = datetime.now(timezone.utc)
+            _total_options_priced += n
             logger.info("Cycle complete — %d options priced.", n)
         except asyncio.CancelledError:
             raise
@@ -218,7 +227,9 @@ async def _process_symbol(
 
     # ── Redis price cache ─────────────────────────────────────────────────────
     redis_client = await _get_redis()
+    cached_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
     await redis_client.set(f"price:{symbol}", str(spot), ex=_REDIS_TTL)
+    await redis_client.set(f"price_ts:{symbol}", cached_at, ex=_REDIS_TTL)
 
     # ── Persist market data row ───────────────────────────────────────────────
     ask_size = int(getattr(quote, "ask_size", 0) or 0)
@@ -353,6 +364,51 @@ async def _price_and_save(
 
 
 # ── Public helpers ────────────────────────────────────────────────────────────
+
+
+async def get_cached_market_data(symbol: str) -> "dict | None":
+    """Read the cached spot price and timestamp for *symbol* from Redis.
+
+    Returns:
+        Dict with ``symbol``, ``price`` (float), and ``cached_at`` (ISO string),
+        or ``None`` if the cache entry is absent or expired.
+    """
+    try:
+        client = await _get_redis()
+        price_val, ts_val = await asyncio.gather(
+            client.get(f"price:{symbol}"),
+            client.get(f"price_ts:{symbol}"),
+        )
+        if price_val is None:
+            return None
+        return {
+            "symbol": symbol,
+            "price": float(price_val),
+            "cached_at": ts_val,
+        }
+    except Exception as exc:
+        logger.warning("Redis read failed for %s: %s", symbol, exc)
+        return None
+
+
+def get_pipeline_state() -> "dict":
+    """Return a snapshot of the fetcher's internal bookkeeping state.
+
+    Returns:
+        Dict with ``last_cycle_at`` (ISO string or ``None``),
+        ``total_options_priced`` (int), and ``is_running`` (bool).
+    """
+    running = _task is not None and not _task.done()
+    last = (
+        _last_cycle_at.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+        if _last_cycle_at is not None
+        else None
+    )
+    return {
+        "last_cycle_at": last,
+        "total_options_priced": _total_options_priced,
+        "is_running": running,
+    }
 
 
 async def get_cached_price(symbol: str) -> float | None:

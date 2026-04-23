@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -379,6 +379,45 @@ async def get_recent_signals(limit: int = 20) -> list[dict[str, Any]]:
             limit,
         )
     return [dict(r) for r in rows]
+
+
+async def get_latest_greeks(
+    symbol: str,
+    strike: float,
+    expiry: date,
+) -> dict[str, Any] | None:
+    """Return the most recent Greeks row for a specific option contract.
+
+    Joins ``calculated_greeks`` with ``options_data`` to filter by the
+    underlying symbol, strike, and expiry.
+
+    Args:
+        symbol: Underlying ticker (e.g. ``"SPY"``).
+        strike: Strike price.
+        expiry: Option expiry date.
+
+    Returns:
+        Dict of all ``calculated_greeks`` columns plus ``option_type``,
+        ``strike``, ``expiry``, and ``symbol`` from ``options_data``,
+        or ``None`` if no matching row exists.
+    """
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT cg.*, od.option_type, od.strike, od.expiry, od.symbol
+            FROM   calculated_greeks cg
+            JOIN   options_data od ON od.id = cg.option_id
+            WHERE  od.symbol = $1
+              AND  od.strike = $2
+              AND  od.expiry = $3
+            ORDER BY cg.timestamp DESC
+            LIMIT 1
+            """,
+            symbol,
+            strike,
+            expiry,
+        )
+    return dict(row) if row is not None else None
 
 
 async def get_latest_options(symbol: str) -> list[dict[str, Any]]:
