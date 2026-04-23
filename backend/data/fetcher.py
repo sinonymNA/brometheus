@@ -349,7 +349,8 @@ async def _price_and_save(
                 r=_RISK_FREE_RATE,
                 sigma=iv,
                 symbol=row["symbol"],
-                expiry=str(row["expiry"]),
+                expiry=row["expiry"],
+                option_type=row["option_type"],
             )
             await save_greeks(option_id, greeks, underlying_price=spot)
             priced += 1

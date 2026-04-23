@@ -22,8 +22,8 @@ from __future__ import annotations
 
 import math
 import sys
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from typing import Literal
 
 from scipy.stats import norm
@@ -63,16 +63,21 @@ class GreeksResult:
     # Volatility
     iv: float           # annualised vol used for this calculation
 
-    # Contract metadata
-    symbol: str         # underlying ticker, e.g. "SPY"
-    strike: float       # strike price K
-    expiry: str         # expiry label, e.g. "2026-06-20"
-    calculated_at: datetime
+    # Contract metadata (all optional — safe to construct without them)
+    symbol: str = ""
+    strike: float = 0.0
+    expiry: date | None = None
+    option_type: str = ""
+    underlying_price: float = 0.0
+    calculated_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
 
     def __str__(self) -> str:
+        exp_str = str(self.expiry) if self.expiry is not None else "?"
         return (
             f"GreeksResult  {self.symbol or '?'}  "
-            f"K={self.strike}  exp={self.expiry or '?'}  σ={self.iv:.4f}\n"
+            f"K={self.strike}  exp={exp_str}  σ={self.iv:.4f}\n"
             f"  call={self.call_price:.4f}   put={self.put_price:.4f}\n"
             f"  Δ={self.delta:.4f}   Γ={self.gamma:.6f}   "
             f"V={self.vega:.4f}   Θ={self.theta:.4f}/day   "
@@ -83,17 +88,13 @@ class GreeksResult:
 # ── Private helpers ───────────────────────────────────────────────────────────
 
 
-def _validate(S: float, K: float, T: float, sigma: float) -> None:
-    """Raise ValueError listing every invalid input (checks all, not fail-fast)."""
+def _validate(S: float, K: float) -> None:
+    """Raise ValueError if underlying price or strike are non-positive."""
     bad: list[str] = []
     if S <= 0:
         bad.append(f"S must be > 0 (got {S})")
     if K <= 0:
         bad.append(f"K must be > 0 (got {K})")
-    if T <= 0:
-        bad.append(f"T must be > 0 (got {T})")
-    if sigma <= 0:
-        bad.append(f"sigma must be > 0 (got {sigma})")
     if bad:
         raise ValueError("Invalid inputs:\n" + "\n".join(f"  {b}" for b in bad))
 
@@ -122,9 +123,15 @@ def calculate(
     r: float = 0.05,
     sigma: float = 0.20,
     symbol: str = "",
-    expiry: str = "",
+    expiry: date | None = None,
+    option_type: str = "call",
 ) -> GreeksResult:
     """Compute Black-Scholes prices and all five Greeks for a European option.
+
+    Handles edge cases gracefully rather than raising:
+
+    - **T ≤ 0** (expired or same-day): returns intrinsic value, zero Greeks.
+    - **sigma ≤ 0**: returns intrinsic value, zero Greeks.
 
     Assumes no dividends, continuous compounding, and European-style exercise.
 
@@ -132,21 +139,45 @@ def calculate(
         S: Current underlying price (e.g. ``100.0``).
         K: Strike price (e.g. ``105.0``).
         T: Time to expiry in **years** (e.g. ``0.25`` for three months).
+            Values ≤ 0 return intrinsic value with zero Greeks.
         r: Annualised risk-free rate as a decimal. Default ``0.05``.
         sigma: Annualised implied volatility as a decimal. Default ``0.20``.
+            Values ≤ 0 return intrinsic value with zero Greeks.
         symbol: Optional underlying ticker for labelling (e.g. ``"SPY"``).
-        expiry: Optional expiry label (e.g. ``"2026-06-20"``).
+        expiry: Optional expiry date.
+        option_type: ``"call"`` or ``"put"`` — stored in result for reference.
 
     Returns:
         :class:`GreeksResult` with both call/put prices and all Greeks.
 
     Raises:
-        ValueError: If S, K, T, or sigma are non-positive.
+        ValueError: If S or K are non-positive.
 
     Reference values (S=100, K=100, T=0.25, r=0.05, σ=0.20):
         call_price≈4.61, put_price≈3.37, delta≈0.57, gamma≈0.039
     """
-    _validate(S, K, T, sigma)
+    _validate(S, K)
+
+    # Edge case: expired option or zero/negative vol — return intrinsic, zero Greeks.
+    if T <= 0 or sigma <= 0:
+        call_intr = max(0.0, S - K)
+        put_intr = max(0.0, K - S)
+        return GreeksResult(
+            call_price=call_intr,
+            put_price=put_intr,
+            delta=1.0 if S > K else 0.0,
+            gamma=0.0,
+            vega=0.0,
+            theta=0.0,
+            rho=0.0,
+            iv=max(sigma, 0.0),
+            symbol=symbol,
+            strike=K,
+            expiry=expiry,
+            option_type=option_type,
+            underlying_price=S,
+            calculated_at=datetime.now(timezone.utc),
+        )
 
     sqrt_T = math.sqrt(T)
     discount = math.exp(-r * T)
@@ -191,6 +222,8 @@ def calculate(
         symbol=symbol,
         strike=K,
         expiry=expiry,
+        option_type=option_type,
+        underlying_price=S,
         calculated_at=datetime.now(timezone.utc),
     )
 
@@ -224,7 +257,7 @@ def calculate_iv(
         market_price: Observed mid-price of the option.
         S: Current underlying price.
         K: Strike price.
-        T: Time to expiry in years.
+        T: Time to expiry in years. Returns ``None`` immediately if T ≤ 0.
         r: Annualised risk-free rate.
         option_type: ``"call"`` (default) or ``"put"``.
         max_iterations: Hard cap on Newton steps. Default 100.
@@ -232,12 +265,16 @@ def calculate_iv(
             Default ``1e-4`` (≈ $0.0001).
 
     Returns:
-        Implied volatility as a decimal (e.g. ``0.20``), or ``None`` if:
+        Implied volatility in ``[0.001, 20.0]``, or ``None`` if:
 
+        - *T* ≤ 0,
         - *market_price* is below the option's intrinsic value,
         - vega collapses near zero (very deep ITM/OTM),
         - the solver diverges or exhausts *max_iterations*.
     """
+    if T <= 0:
+        return None
+
     discount = math.exp(-r * T)
 
     # Reject prices below intrinsic — no real solution exists.
@@ -249,7 +286,7 @@ def calculate_iv(
         return None
 
     # Brenner-Subrahmanyam initial guess, clamped to a sane range.
-    sigma = max(0.01, min(5.0, market_price / (S * math.sqrt(T / (2.0 * math.pi)))))
+    sigma = max(0.001, min(5.0, market_price / (S * math.sqrt(T / (2.0 * math.pi)))))
     sqrt_T = math.sqrt(T)
 
     for _ in range(max_iterations):
@@ -273,7 +310,7 @@ def calculate_iv(
             return None  # vega ≈ 0: can't update; give up
 
         sigma -= diff / vega_raw
-        if not (0.0 < sigma <= 10.0):
+        if not (0.001 <= sigma <= 20.0):
             return None  # diverged out of any meaningful vol range
 
     return None  # did not converge
@@ -283,7 +320,7 @@ def calculate_iv(
 
 
 def _run_tests() -> None:
-    """Three self-tests that print PASS or FAIL for each assertion.
+    """Four self-tests that print PASS or FAIL for each assertion.
 
     Correct Black-Scholes reference values for S=100, K=100, T=0.25,
     r=0.05, σ=0.20:
@@ -311,7 +348,8 @@ def _run_tests() -> None:
 
     # ── Test 1: ATM call pricing and key Greeks ───────────────────────────────
     print("Test 1: ATM call pricing  S=100, K=100, T=0.25, r=0.05, σ=0.20")
-    r1 = calculate(S, K, T, r, sigma, symbol="TEST", expiry="2026-07-25")
+    r1 = calculate(S, K, T, r, sigma, symbol="TEST", expiry=date(2026, 7, 25),
+                   option_type="call")
     print(r1)
 
     check("call_price", r1.call_price, 4.6150, tol=0.01, spec_ref="≈5.08")
@@ -320,6 +358,10 @@ def _run_tests() -> None:
     check("vega",       r1.vega,       0.1964, tol=0.005)
     check("theta",      r1.theta,     -0.0287, tol=0.005)
     check("rho",        r1.rho,        0.1308, tol=0.005)
+
+    assert r1.option_type == "call"
+    assert r1.underlying_price == S
+    assert r1.expiry == date(2026, 7, 25)
 
     # ── Test 2: Put-call parity  C − P = S − K·e^{−rT} ───────────────────────
     print("\nTest 2: Put-call parity  C − P = S − K·e^{-rT}")
@@ -343,6 +385,23 @@ def _run_tests() -> None:
             failures += 1
         else:
             check(f"{opt_type} IV", iv, sigma, tol=0.001)
+
+    # ── Test 4: Edge cases (T≤0, sigma≤0) ────────────────────────────────────
+    print("\nTest 4: Edge cases")
+
+    r_exp = calculate(100.0, 90.0, T=0.0, r=0.05, sigma=0.20)
+    ok_exp = abs(r_exp.call_price - 10.0) < 0.01 and r_exp.gamma == 0.0 and r_exp.delta == 1.0
+    print(f"  {'PASS' if ok_exp else 'FAIL'}  T=0: "
+          f"call={r_exp.call_price:.2f} delta={r_exp.delta} gamma={r_exp.gamma}")
+    if not ok_exp:
+        failures += 1
+
+    r_sig = calculate(100.0, 100.0, T=0.25, r=0.05, sigma=0.0)
+    ok_sig = r_sig.call_price == 0.0 and r_sig.gamma == 0.0 and r_sig.vega == 0.0
+    print(f"  {'PASS' if ok_sig else 'FAIL'}  sigma=0: "
+          f"call={r_sig.call_price:.2f} gamma={r_sig.gamma} vega={r_sig.vega}")
+    if not ok_sig:
+        failures += 1
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print()
