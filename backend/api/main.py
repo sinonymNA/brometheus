@@ -69,15 +69,15 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    from backend.utils.config import settings
-    from backend.core.risk_manager import RiskManager
-    from backend.core.strategy_runner import StrategyRunner
-
     app.state.ready = False
+    app.state.strategy_runner = None
+    app.state.risk_manager = None
+    app.state.alpaca = None
+    app.state.alpaca_connected = False
+
+    from backend.utils.config import settings
 
     logger.info("APEX CRUSHER starting… version=%s", _VERSION)
-
-    # a. Config is already loaded via settings import above.
     logger.info("Alpaca base URL: %s", settings.alpaca_base_url)
 
     # b. Database
@@ -106,17 +106,30 @@ async def on_startup() -> None:
     app.state.alpaca_connected = connected
 
     # d. Data fetcher
-    app.state.fetcher_task = await start_fetcher()
-    logger.info("Fetcher started.")
+    try:
+        app.state.fetcher_task = await start_fetcher()
+        logger.info("Fetcher started.")
+    except Exception as exc:
+        logger.error("Fetcher failed to start: %s", exc)
 
     # e. Strategy runner
-    runner = StrategyRunner(alpaca_client=client)
-    app.state.strategy_runner = runner
-    await runner.start()
-    logger.info("StrategyRunner started.")
-
-    # f. Shared risk manager for API endpoints
-    app.state.risk_manager = RiskManager()
+    try:
+        from backend.core.risk_manager import RiskManager
+        from backend.core.strategy_runner import StrategyRunner
+        runner = StrategyRunner(alpaca_client=client)
+        app.state.strategy_runner = runner
+        await runner.start()
+        app.state.risk_manager = RiskManager()
+        logger.info("StrategyRunner started.")
+    except Exception as exc:
+        logger.error("StrategyRunner failed to start: %s", exc, exc_info=True)
+        # Ensure risk_manager is always available even if StrategyRunner failed
+        try:
+            from backend.core.risk_manager import RiskManager as _RM
+            if app.state.risk_manager is None:
+                app.state.risk_manager = _RM()
+        except Exception:
+            pass
 
     # g. Mark ready
     app.state.ready = True
