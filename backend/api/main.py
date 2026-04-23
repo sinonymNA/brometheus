@@ -724,6 +724,20 @@ async def _opt_mid(symbol: str) -> float | None:
 _backtest_jobs: dict[str, dict] = {}   # job_id → {status, progress, result, error}
 
 
+@app.post("/api/backtest/clear-cache", tags=["backtest"])
+async def clear_backtest_cache() -> dict:
+    """Clear all cached backtest data (stock bars, VIX, etc)."""
+    try:
+        from backend.backtesting.data_loader import HistoricalDataLoader
+        loader = HistoricalDataLoader(app.state.alpaca)
+        loader.clear_cache()
+        logger.info("Backtest cache cleared")
+        return {"status": "ok", "message": "Cache cleared"}
+    except Exception as e:
+        logger.error("Failed to clear cache: %s", e)
+        return {"status": "error", "message": str(e)}
+
+
 @app.get("/api/backtest/presets", tags=["backtest"])
 async def backtest_presets() -> dict:
     today = date.today()

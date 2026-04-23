@@ -40,6 +40,14 @@ class HistoricalDataLoader:
         self._cache_dir = Path("backtest_cache")
         self._cache_dir.mkdir(exist_ok=True)
 
+    def clear_cache(self) -> None:
+        """Delete all cached data files."""
+        import shutil
+        if self._cache_dir.exists():
+            shutil.rmtree(self._cache_dir)
+            self._cache_dir.mkdir(exist_ok=True)
+            logger.info("Cleared backtest cache")
+
     async def load_stock_data(
         self,
         symbols: list[str],
@@ -73,9 +81,26 @@ class HistoricalDataLoader:
             end_date,
             timeframe,
         )
-        bars: dict[str, list[Any]] = await self._alpaca.get_bars(
+        bars_result = await self._alpaca.get_bars(
             symbols, timeframe, start_date, end_date
         )
+
+        # Convert BarSet (or dict) to plain dict for reliable pickling
+        bars: dict[str, list[Any]] = {}
+        try:
+            # Try dict-like access (works for dict and BarSet)
+            if hasattr(bars_result, 'items'):
+                for symbol, bar_list in bars_result.items():
+                    bars[symbol] = list(bar_list)
+            else:
+                # Fallback: assume it's already dict-like
+                bars = dict(bars_result)
+        except Exception as e:
+            logger.warning("Failed to convert bars to dict: %s. Using as-is", e)
+            bars = bars_result
+
+        logger.info("Loaded %d symbols with %d total bars",
+                   len(bars), sum(len(b) for b in bars.values() if isinstance(b, list)))
 
         with cache_file.open("wb") as fh:
             pickle.dump(bars, fh)
