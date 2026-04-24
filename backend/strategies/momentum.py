@@ -6,6 +6,7 @@ and a benign IV environment are all present simultaneously.
 
 from __future__ import annotations
 
+import collections
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -28,6 +29,10 @@ class MomentumStrategy(BaseStrategy):
     RSI_BEAR_THRESHOLD = 38    # RSI must be below this for a bearish signal
     VOLUME_RATIO_MIN = 1.5     # current bar volume / 20-bar avg
     IV_RANK_MAX = 60           # avoid expensive options when IV is already high
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.near_misses: collections.deque = collections.deque(maxlen=100)
 
     async def scan(self) -> list[dict[str, Any]]:
         """Scan all symbols and return signals for untraded symbols that qualify."""
@@ -90,6 +95,39 @@ class MomentumStrategy(BaseStrategy):
         )
 
         if not (bull or bear):
+            # Near-miss detection
+            bull_near = (
+                self.RSI_BULL_THRESHOLD - 15 <= rsi < self.RSI_BULL_THRESHOLD
+                and volume_ratio >= 1.0
+            )
+            bear_near = (
+                self.RSI_BEAR_THRESHOLD < rsi <= self.RSI_BEAR_THRESHOLD + 15
+                and volume_ratio >= 1.0
+            )
+            if bull_near or bear_near:
+                self.near_misses.append({
+                    "symbol": symbol,
+                    "direction": "bull" if bull_near else "bear",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "rsi": round(rsi, 2),
+                    "rsi_threshold": self.RSI_BULL_THRESHOLD if bull_near else self.RSI_BEAR_THRESHOLD,
+                    "rsi_pass": rsi >= self.RSI_BULL_THRESHOLD if bull_near else rsi <= self.RSI_BEAR_THRESHOLD,
+                    "volume_ratio": round(volume_ratio, 3),
+                    "volume_pass": volume_ratio >= self.VOLUME_RATIO_MIN,
+                    "iv_rank": round(iv_rank, 1),
+                    "iv_pass": iv_rank <= self.IV_RANK_MAX,
+                    "price_pct": round(
+                        (current / high_10 - 1) * 100 if bull_near else (1 - current / low_10) * 100,
+                        3,
+                    ),
+                    "price_pass": current > high_10 if bull_near else current < low_10,
+                    "conditions_passed": sum([
+                        rsi >= self.RSI_BULL_THRESHOLD if bull_near else rsi <= self.RSI_BEAR_THRESHOLD,
+                        volume_ratio >= self.VOLUME_RATIO_MIN,
+                        iv_rank <= self.IV_RANK_MAX,
+                        current > high_10 if bull_near else current < low_10,
+                    ]),
+                })
             return None
 
         direction = "call" if bull else "put"

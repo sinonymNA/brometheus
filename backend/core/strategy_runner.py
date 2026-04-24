@@ -16,6 +16,7 @@ Usage (from FastAPI startup)::
 from __future__ import annotations
 
 import asyncio
+import collections
 from datetime import date
 from typing import Any
 
@@ -51,6 +52,7 @@ class StrategyRunner:
         self._flow     = FlowStrategy(alpaca_client, storage)
 
         self._task: asyncio.Task[None] | None = None
+        self.near_misses: collections.deque = collections.deque(maxlen=200)
 
     # ── Public lifecycle ──────────────────────────────────────────────────────
 
@@ -118,6 +120,14 @@ class StrategyRunner:
                 logger.error("Strategy %s scan error: %s", names[i], result)
             elif isinstance(result, list):
                 signals.extend(result)
+
+        # Collect near-misses from each strategy
+        for strat in (self._momentum, self._iv_rank, self._flow):
+            nm_list = list(getattr(strat, "near_misses", None) or [])
+            for item in reversed(nm_list):
+                self.near_misses.appendleft(item)
+            if hasattr(strat, "near_misses"):
+                strat.near_misses.clear()
 
         # Step 3: sort + deduplicate
         signals.sort(key=lambda s: float(s.get("strength", 0)), reverse=True)

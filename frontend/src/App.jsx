@@ -9,6 +9,7 @@ import TradeHistory from './components/TradeHistory.jsx'
 import PipelineStatus from './components/PipelineStatus.jsx'
 import BacktestUI from './components/BacktestUI.jsx'
 import ParameterOptimizer from './components/ParameterOptimizer.jsx'
+import NearMisses from './components/NearMisses.jsx'
 import {
   formatMoney, formatPercent, formatPct, formatTime, formatNumber
 } from './utils/formatting.js'
@@ -294,7 +295,7 @@ export default function App() {
                 </Card>
               </div>
 
-              {/* ── Column 3: Trade History + Pipeline ─────────────────────── */}
+              {/* ── Column 3: Trade History + Pipeline + Near Misses ───────── */}
               <div className="flex flex-col gap-3">
                 <Card title="Trade History (last 20)">
                   <TradeHistory trades={ws ? [] : []} />
@@ -308,6 +309,10 @@ export default function App() {
                     redisConnected={health?.db_connected ?? false}
                     marketOpen={marketOpen}
                   />
+                </Card>
+
+                <Card title="Near Misses">
+                  <NearMisses get={get} />
                 </Card>
               </div>
 

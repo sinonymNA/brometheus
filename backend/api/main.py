@@ -321,6 +321,13 @@ async def signals_recent() -> dict[str, Any]:
     return {"count": len(rows), "signals": rows, "timestamp": _utc_now()}
 
 
+@app.get("/api/signals/near-misses", tags=["signals"])
+async def get_near_misses() -> dict:
+    runner = getattr(app.state, "strategy_runner", None)
+    misses = list(getattr(runner, "near_misses", [])) if runner else []
+    return {"near_misses": misses[:50]}
+
+
 @app.get("/api/trades/open", tags=["trading"], dependencies=[Depends(require_ready)])
 async def trades_open() -> dict[str, Any]:
     from backend.data.storage import get_open_trades
@@ -596,6 +603,13 @@ async def _build_ws_payload() -> dict[str, Any]:
         ]
     except Exception as exc:
         logger.debug("WS recent_signals error: %s", exc)
+
+    # Near misses
+    try:
+        runner = getattr(app.state, "strategy_runner", None)
+        payload["near_misses"] = list(getattr(runner, "near_misses", []))[:20]
+    except Exception:
+        payload["near_misses"] = []
 
     # Portfolio Greeks (net exposure across open trades)
     try:

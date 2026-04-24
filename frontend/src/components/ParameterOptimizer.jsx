@@ -33,6 +33,28 @@ function randomizeParams() {
   return result
 }
 
+// Sample within ±radiusFraction of the full range around base values
+function randomizeParamsNear(base, radiusFraction) {
+  const result = {}
+  for (const d of PARAM_DEFS) {
+    const baseVal = base[d.key] ?? d.default
+    const halfRange = (d.max - d.min) * radiusFraction * 0.5
+    const lo = Math.max(d.min, baseVal - halfRange)
+    const hi = Math.min(d.max, baseVal + halfRange)
+    const steps = Math.max(0, Math.round((hi - lo) / d.step))
+    const pick = Math.floor(Math.random() * (steps + 1))
+    result[d.key] = parseFloat((lo + pick * d.step).toFixed(10))
+  }
+  return result
+}
+
+function loadStarters() {
+  try { return JSON.parse(localStorage.getItem('apex_starters') || '[]') } catch { return [] }
+}
+function saveStarters(starters) {
+  localStorage.setItem('apex_starters', JSON.stringify(starters))
+}
+
 // ── Result table column definitions ──────────────────────────────────────────
 
 const RESULT_COLS = [
@@ -186,7 +208,7 @@ function ResultsTable({ runs, onClear, onExport }) {
 
 // ── Best combo finder ─────────────────────────────────────────────────────────
 
-function BestComboCard({ runs, onApply }) {
+function BestComboCard({ runs, onApply, onSave }) {
   if (runs.length < 5) return (
     <div className="p-3 rounded text-xs muted text-center"
       style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)' }}>
@@ -212,11 +234,18 @@ function BestComboCard({ runs, onApply }) {
         <span className="text-xs uppercase tracking-widest font-bold" style={{ color: '#00FF88' }}>
           ★ Best Combo — Run #{best.run}
         </span>
-        <button onClick={() => onApply(params)}
-          className="text-xs px-3 py-1 rounded font-bold uppercase"
-          style={{ background: 'rgba(0,255,136,0.2)', color: '#00FF88', border: '1px solid #00FF88' }}>
-          Apply to Live Bot
-        </button>
+        <div className="flex gap-2">
+          <button onClick={() => onSave(best, params)}
+            className="text-xs px-3 py-1 rounded font-bold uppercase"
+            style={{ background: 'rgba(255,184,0,0.2)', color: '#FFB800', border: '1px solid #FFB800' }}>
+            ★ Save as Starter
+          </button>
+          <button onClick={() => onApply(params)}
+            className="text-xs px-3 py-1 rounded font-bold uppercase"
+            style={{ background: 'rgba(0,255,136,0.2)', color: '#00FF88', border: '1px solid #00FF88' }}>
+            Apply to Live Bot
+          </button>
+        </div>
       </div>
       <div className="grid grid-cols-3 gap-2 text-xs">
         <div><span className="muted">Win Rate </span><span className="pos font-bold">{formatPct(best.win_rate * 100)}</span></div>
@@ -256,8 +285,11 @@ export default function ParameterOptimizer({ get, post }) {
   const [jobId, setJobId]           = useState(null)
   const [jobStatus, setJobStatus]   = useState(null)
   const [applyMsg, setApplyMsg]     = useState('')
-  const [batchCount, setBatchCount] = useState(10)
+  const [batchCount, setBatchCount]       = useState(10)
   const [batchProgress, setBatchProgress] = useState(null)
+  const [starters, setStarters]           = useState(loadStarters)
+  const [selectedStarter, setSelectedStarter] = useState(null)
+  const [starterRadius, setStarterRadius] = useState(0.25)
   const pollRef    = useRef(null)
   const batchAbort = useRef(false)
 
@@ -306,13 +338,45 @@ export default function ParameterOptimizer({ get, post }) {
     return null
   }, [useCustom, customDates, datePreset, post, get])
 
+  const handleSaveStarter = useCallback((runRow, runParams) => {
+    const name = `Run #${runRow.run} — WR ${(runRow.win_rate * 100).toFixed(0)}% PF ${(runRow.profit_factor ?? 0).toFixed(2)}`
+    const starter = {
+      id: Date.now(),
+      name,
+      params: { ...runParams },
+      metrics: {
+        win_rate: runRow.win_rate,
+        profit_factor: runRow.profit_factor,
+        total_return: runRow.total_return,
+        sharpe: runRow.sharpe,
+      },
+      savedAt: new Date().toISOString(),
+    }
+    setStarters(prev => {
+      const next = [starter, ...prev].slice(0, 10)
+      saveStarters(next)
+      return next
+    })
+  }, [])
+
+  const handleDeleteStarter = useCallback((id) => {
+    setStarters(prev => {
+      const next = prev.filter(s => s.id !== id)
+      saveStarters(next)
+      if (selectedStarter?.id === id) setSelectedStarter(null)
+      return next
+    })
+  }, [selectedStarter])
+
   const handleBatchRun = useCallback(async () => {
     batchAbort.current = false
     let localCount = runCount
     for (let i = 0; i < batchCount; i++) {
       if (batchAbort.current) break
       setBatchProgress({ current: i + 1, total: batchCount })
-      const rp = randomizeParams()
+      const rp = selectedStarter
+        ? randomizeParamsNear(selectedStarter.params, starterRadius)
+        : randomizeParams()
       setParams(rp)
       setJobStatus({ status: 'running', progress: 0, message: `Batch ${i + 1}/${batchCount} — submitting…` })
       const result = await runOne(rp)
@@ -339,7 +403,7 @@ export default function ParameterOptimizer({ get, post }) {
     }
     setBatchProgress(null)
     setJobStatus(null)
-  }, [batchCount, runOne, runCount])
+  }, [batchCount, runOne, runCount, selectedStarter, starterRadius])
 
   const startPoll = useCallback((id) => {
     if (pollRef.current) clearInterval(pollRef.current)
@@ -516,7 +580,7 @@ export default function ParameterOptimizer({ get, post }) {
               <button onClick={handleBatchRun} disabled={isRunning}
                 className="text-xs px-4 py-1 rounded font-bold uppercase tracking-wider ml-auto disabled:opacity-50"
                 style={{ background: 'rgba(255,184,0,0.15)', color: '#FFB800', border: '1px solid #FFB800' }}>
-                ⚡ Run {batchCount} Random Combos
+                ⚡ Run {batchCount} {selectedStarter ? `Near "${selectedStarter.name.split('—')[0].trim()}"` : 'Random'} Combos
               </button>
             )}
           </div>
@@ -535,7 +599,72 @@ export default function ParameterOptimizer({ get, post }) {
         </div>
       </div>
 
-      {/* ── Section 4: Results table ───────────────────────────────────────── */}
+      {/* ── Section 4: Saved Starter Strategies ───────────────────────────── */}
+      {starters.length > 0 && (
+        <div className="card p-3 flex flex-col gap-3">
+          <div className="flex items-center justify-between">
+            <span className="text-xs uppercase tracking-widest muted">Saved Starters</span>
+            {selectedStarter && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs muted">Search radius:</span>
+                <input type="range" min={0.05} max={0.5} step={0.05} value={starterRadius}
+                  onChange={e => setStarterRadius(parseFloat(e.target.value))}
+                  className="w-24 h-1 rounded-full appearance-none cursor-pointer"
+                  style={{ accentColor: '#FFB800' }} />
+                <span className="text-xs font-mono" style={{ color: '#FFB800' }}>
+                  ±{(starterRadius * 50).toFixed(0)}%
+                </span>
+                <button onClick={() => setSelectedStarter(null)}
+                  className="text-xs px-2 py-0.5 rounded muted"
+                  style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)' }}>
+                  ✕ Clear
+                </button>
+              </div>
+            )}
+          </div>
+          <div className="flex flex-col gap-2">
+            {starters.map(s => (
+              <div key={s.id}
+                onClick={() => setSelectedStarter(sel => sel?.id === s.id ? null : s)}
+                className="flex items-center justify-between p-2 rounded cursor-pointer"
+                style={{
+                  background: selectedStarter?.id === s.id ? 'rgba(255,184,0,0.1)' : 'rgba(255,255,255,0.04)',
+                  border: selectedStarter?.id === s.id ? '1px solid #FFB800' : '1px solid rgba(255,255,255,0.08)',
+                }}>
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-xs font-bold" style={{ color: selectedStarter?.id === s.id ? '#FFB800' : '#E8EAED' }}>
+                    {selectedStarter?.id === s.id ? '▶ ' : ''}{s.name}
+                  </span>
+                  <span className="text-xs muted">
+                    Return {((s.metrics?.total_return ?? 0) * 100).toFixed(1)}% · Sharpe {(s.metrics?.sharpe ?? 0).toFixed(2)}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    className="text-xs px-2 py-0.5 rounded"
+                    style={{ background: 'rgba(0,217,255,0.1)', color: '#00D9FF', border: '1px solid rgba(0,217,255,0.3)' }}
+                    title="Load params into sliders"
+                    onClick={e => { e.stopPropagation(); setParams({ ...s.params }) }}>
+                    Load
+                  </button>
+                  <button onClick={e => { e.stopPropagation(); handleDeleteStarter(s.id) }}
+                    className="text-xs px-2 py-0.5 rounded muted"
+                    style={{ background: 'rgba(255,0,85,0.1)', color: '#FF0055', border: '1px solid rgba(255,0,85,0.3)' }}>
+                    ✕
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+          {selectedStarter && (
+            <div className="text-xs p-2 rounded" style={{ background: 'rgba(255,184,0,0.08)', color: '#FFB800' }}>
+              Batch will sample within ±{(starterRadius * 50).toFixed(0)}% of each parameter in "{selectedStarter.name}"
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Section 5: Results table ───────────────────────────────────────── */}
       {runs.length > 0 && (
         <div className="card p-3">
           <div className="text-xs uppercase tracking-widest muted mb-3">Results Comparison</div>
@@ -543,10 +672,10 @@ export default function ParameterOptimizer({ get, post }) {
         </div>
       )}
 
-      {/* ── Section 5: Best combo finder ──────────────────────────────────── */}
+      {/* ── Section 6: Best combo finder ──────────────────────────────────── */}
       <div className="card p-3">
         <div className="text-xs uppercase tracking-widest muted mb-3">Best Combination Finder</div>
-        <BestComboCard runs={runs} onApply={handleApply} />
+        <BestComboCard runs={runs} onApply={handleApply} onSave={handleSaveStarter} />
       </div>
 
     </div>
