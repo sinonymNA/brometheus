@@ -578,7 +578,7 @@ class BacktestEngine:
             open_trades = still_open
 
             # ── Signal generation + entry ────────────────────────────────────
-            if len(open_trades) < MAX_CONCURRENT_POSITIONS:
+            if len(open_trades) < params.max_positions:
                 for sym in self._symbols:
                     spot = closes_by_symbol.get(sym, {}).get(today, 0.0)
                     if spot <= 0:
