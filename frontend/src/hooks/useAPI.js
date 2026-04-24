@@ -42,15 +42,16 @@ export function useAPI() {
       console.log('[API POST]', path, 'body:', JSON.stringify(data, null, 2))
       const res = await axios.post(path, data, {
         headers: { 'Content-Type': 'application/json' },
-        signal: abortRef.current?.signal,
       })
       console.log('[API POST] response:', res.data)
       setLoading(false)
       return res.data
     } catch (err) {
-      console.error('[API POST] error:', err.response?.data || err.message)
-      setError(err.message)
-      setLoading(false)
+      if (!axios.isCancel(err)) {
+        console.error('[API POST] error:', err.response?.data || err.message)
+        setError(err.message)
+        setLoading(false)
+      }
       return null
     }
   }, [])
