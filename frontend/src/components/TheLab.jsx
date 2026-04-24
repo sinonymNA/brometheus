@@ -23,6 +23,16 @@ const PARAM_DEFS = [
   { key: 'position_size_pct',  label: 'Position Size',  min: 0.005,max: 0.05,step: 0.005, default: 0.02, fmt: v => (v*100).toFixed(1)+'%' },
 ]
 const DEFAULTS = Object.fromEntries(PARAM_DEFS.map(p => [p.key, p.default]))
+const BEST_HISTORICAL_RUN = {
+  label: 'Run #1',
+  stats: { win_rate: 0.6667, total_return_pct: 0.0154, profit_factor: 2.59, total_trades: 9, sharpe_ratio: 0.97, max_drawdown_pct: 0.0869 },
+  params: {
+    rsi_bull_threshold: 73, rsi_bear_threshold: 26, volume_ratio_min: 1.2,
+    iv_rank_max: 72, iv_rank_min: 61, signal_strength_min: 0.45,
+    stop_loss_pct: 0.14, profit_target_pct: 0.25, min_dte: 9, max_dte: 44,
+    max_positions: 6, position_size_pct: 0.025,
+  },
+}
 const SYMBOLS_ALL = ['SPY','QQQ','AAPL','NVDA','TSLA','MSFT','AMD','META']
 const STRATEGIES_ALL = ['momentum','iv_rank','flow']
 const DATE_PRESETS = [
@@ -662,6 +672,8 @@ function OptimizerTab({ runs, params, onParamChange, post }) {
   const [prediction, setPrediction]   = useState(null)
   const [predLoading, setPredLoading] = useState(false)
   const [predDebounce, setPredDebounce] = useState(null)
+  const [bestLoaded, setBestLoaded]   = useState(false)
+  const [bestExpanded, setBestExpanded] = useState(true)
 
   const importance = useMemo(() => computeImportance(runs), [runs])
   const regime     = useMemo(() => regimeFromRuns(runs),    [runs])
@@ -698,12 +710,93 @@ function OptimizerTab({ runs, params, onParamChange, post }) {
     Object.entries(recs.parameters).forEach(([k,v]) => onParamChange(k,v))
   }
 
+  function loadBestRun() {
+    Object.entries(BEST_HISTORICAL_RUN.params).forEach(([k,v]) => onParamChange(k,v))
+    setBestLoaded(true)
+  }
+
   const regimeColor = regime==='BULL'?'#00FF88':regime==='BEAR'?'#FF0055':'#FFB800'
+  const bhr = BEST_HISTORICAL_RUN
 
   return (
     <div className="flex gap-3 h-full">
       {/* Left: sliders with live prediction */}
       <div className="w-64 flex flex-col gap-3 overflow-y-auto flex-shrink-0">
+
+        {/* ── Best Historical Run card ── */}
+        <div className="rounded overflow-hidden flex-shrink-0"
+          style={{border:'1px solid rgba(255,184,0,0.4)',background:'rgba(255,184,0,0.05)'}}>
+          {/* Header row — always visible */}
+          <div className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none"
+            style={{borderBottom: bestExpanded ? '1px solid rgba(255,184,0,0.2)' : 'none'}}
+            onClick={() => setBestExpanded(x => !x)}>
+            <span className="text-xs font-bold uppercase tracking-widest flex-1" style={{color:'#FFB800'}}>
+              ★ Best Historical Run
+            </span>
+            <span className="text-xs muted">{bestExpanded ? '▲' : '▼'}</span>
+          </div>
+
+          {bestExpanded && (
+            <div className="px-3 pb-3 pt-2 flex flex-col gap-2">
+              {/* Run label */}
+              <div className="text-xs font-bold" style={{color:'#FFB800'}}>
+                BEST HISTORICAL RUN — {bhr.label}
+              </div>
+
+              {/* Stats */}
+              <div className="flex flex-col gap-0.5 text-xs font-mono">
+                <div className="flex justify-between">
+                  <span className="muted">Win Rate</span>
+                  <span style={{color:'#00FF88'}}>{(bhr.stats.win_rate*100).toFixed(2)}%</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="muted">Return</span>
+                  <span style={{color:'#00FF88'}}>+{(bhr.stats.total_return_pct*100).toFixed(2)}%</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="muted">Profit Factor</span>
+                  <span style={{color:'#00FF88'}}>{bhr.stats.profit_factor.toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="muted">Trades</span>
+                  <span style={{color:'#E8EAED'}}>{bhr.stats.total_trades}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="muted">Sharpe</span>
+                  <span style={{color:'#E8EAED'}}>{bhr.stats.sharpe_ratio.toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="muted">Max DD</span>
+                  <span style={{color:'#FFB800'}}>+{(bhr.stats.max_drawdown_pct*100).toFixed(2)}%</span>
+                </div>
+              </div>
+
+              {/* Description */}
+              <p className="text-xs muted leading-relaxed">
+                These parameters produced your best results to date.
+              </p>
+
+              {/* Load button */}
+              <button onClick={loadBestRun}
+                className="w-full py-1.5 rounded text-xs font-bold uppercase tracking-wider transition-all"
+                style={{
+                  background: bestLoaded
+                    ? 'rgba(0,255,136,0.15)'
+                    : 'linear-gradient(135deg,#FFB800,#FF8C00)',
+                  color: bestLoaded ? '#00FF88' : '#0A0E27',
+                  border: bestLoaded ? '1px solid rgba(0,255,136,0.4)' : 'none',
+                }}>
+                {bestLoaded ? '✓ Loaded' : 'Load these'}
+              </button>
+
+              {/* Sub-label */}
+              <p className="text-xs text-center" style={{color:'rgba(255,184,0,0.6)'}}>
+                Ready to test on different timeframes
+              </p>
+            </div>
+          )}
+        </div>
+
         <div className="card p-3 flex flex-col gap-3">
           <span className="text-xs muted uppercase tracking-widest">Tune Parameters</span>
           <span className="text-xs muted">Adjust sliders — AI predicts performance after 2.5s pause</span>
