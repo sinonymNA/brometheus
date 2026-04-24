@@ -23,6 +23,16 @@ const PARAM_DEFS = [
 
 const DEFAULTS = Object.fromEntries(PARAM_DEFS.map(p => [p.key, p.default]))
 
+function randomizeParams() {
+  const result = {}
+  for (const d of PARAM_DEFS) {
+    const steps = Math.round((d.max - d.min) / d.step)
+    const pick = Math.floor(Math.random() * (steps + 1))
+    result[d.key] = parseFloat((d.min + pick * d.step).toFixed(10))
+  }
+  return result
+}
+
 // ── Result table column definitions ──────────────────────────────────────────
 
 const RESULT_COLS = [
@@ -246,7 +256,10 @@ export default function ParameterOptimizer({ get, post }) {
   const [jobId, setJobId]           = useState(null)
   const [jobStatus, setJobStatus]   = useState(null)
   const [applyMsg, setApplyMsg]     = useState('')
-  const pollRef = useRef(null)
+  const [batchCount, setBatchCount] = useState(10)
+  const [batchProgress, setBatchProgress] = useState(null)
+  const pollRef    = useRef(null)
+  const batchAbort = useRef(false)
 
   const isRunning = jobStatus?.status === 'running'
 
@@ -257,6 +270,57 @@ export default function ParameterOptimizer({ get, post }) {
   const handleReset = useCallback(() => {
     setParams({ ...DEFAULTS })
   }, [])
+
+  // Run one backtest and return result (polls until done, no state side-effects)
+  const runOne = useCallback(async (runParams) => {
+    const start = useCustom ? customDates.start : datePreset.start
+    const end   = useCustom ? customDates.end   : datePreset.end
+    const body  = { start_date: start, end_date: end, symbols: ['SPY', 'QQQ', 'AAPL'], parameters: runParams }
+    const resp  = await post('/api/backtest', body)
+    if (!resp?.job_id) return null
+    let status
+    do {
+      await new Promise(r => setTimeout(r, 2000))
+      status = await get(`/api/backtest/${resp.job_id}`, { ttl: 0 })
+      if (status) setJobStatus(status)
+    } while (status && status.status === 'running')
+    return status?.status === 'done' ? status.result : null
+  }, [useCustom, customDates, datePreset, post, get])
+
+  const handleBatchRun = useCallback(async () => {
+    batchAbort.current = false
+    let localCount = runCount
+    for (let i = 0; i < batchCount; i++) {
+      if (batchAbort.current) break
+      setBatchProgress({ current: i + 1, total: batchCount })
+      const rp = randomizeParams()
+      setParams(rp)
+      setJobStatus({ status: 'running', progress: 0, message: `Batch ${i + 1}/${batchCount} — submitting…` })
+      const result = await runOne(rp)
+      if (result) {
+        localCount++
+        const runNum = localCount
+        setRunCount(localCount)
+        setRuns(prev => [...prev, {
+          run:          runNum,
+          rsi:          `${rp.rsi_bull_threshold}/${rp.rsi_bear_threshold}`,
+          vol_ratio:    rp.volume_ratio_min,
+          strength_min: rp.signal_strength_min,
+          stop_pct:     rp.stop_loss_pct,
+          target_pct:   rp.profit_target_pct,
+          win_rate:     result.win_rate ?? 0,
+          total_return: result.total_return_pct ?? 0,
+          profit_factor:result.profit_factor ?? 0,
+          max_dd:       result.max_drawdown_pct ?? 0,
+          total_trades: result.total_trades ?? 0,
+          sharpe:       result.sharpe_ratio ?? 0,
+          _params:      { ...rp },
+        }])
+      }
+    }
+    setBatchProgress(null)
+    setJobStatus(null)
+  }, [batchCount, runOne, runCount])
 
   const startPoll = useCallback((id) => {
     if (pollRef.current) clearInterval(pollRef.current)
@@ -400,6 +464,56 @@ export default function ParameterOptimizer({ get, post }) {
             {jobStatus.error}
           </div>
         )}
+
+        {/* ── Batch runner ─────────────────────────────────────────────── */}
+        <div className="border-t border-border pt-3 flex flex-col gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs muted uppercase tracking-wider">Auto-run</span>
+            {[5, 10, 20, 50].map(n => (
+              <button key={n} onClick={() => setBatchCount(n)}
+                className="text-xs px-2 py-0.5 rounded font-mono"
+                style={{
+                  background: batchCount === n ? 'rgba(0,217,255,0.2)' : 'rgba(255,255,255,0.05)',
+                  color: batchCount === n ? '#00D9FF' : '#6B7280',
+                  border: batchCount === n ? '1px solid #00D9FF' : '1px solid rgba(255,255,255,0.1)',
+                }}>
+                {n}
+              </button>
+            ))}
+            <input
+              type="number" min={1} max={200} value={batchCount}
+              onChange={e => setBatchCount(Math.max(1, parseInt(e.target.value) || 1))}
+              className="w-16 text-xs font-mono text-center rounded px-1 py-0.5"
+              style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.15)', color: '#E8EAED' }}
+            />
+            <span className="text-xs muted">simulations</span>
+            {batchProgress ? (
+              <button onClick={() => { batchAbort.current = true }}
+                className="text-xs px-3 py-1 rounded font-bold uppercase tracking-wider ml-auto"
+                style={{ background: 'rgba(255,0,85,0.15)', color: '#FF0055', border: '1px solid #FF0055' }}>
+                ■ Stop
+              </button>
+            ) : (
+              <button onClick={handleBatchRun} disabled={isRunning}
+                className="text-xs px-4 py-1 rounded font-bold uppercase tracking-wider ml-auto disabled:opacity-50"
+                style={{ background: 'rgba(255,184,0,0.15)', color: '#FFB800', border: '1px solid #FFB800' }}>
+                ⚡ Run {batchCount} Random Combos
+              </button>
+            )}
+          </div>
+          {batchProgress && (
+            <div className="flex flex-col gap-1">
+              <div className="flex justify-between text-xs">
+                <span className="muted">Simulation {batchProgress.current} of {batchProgress.total}</span>
+                <span className="accent font-mono">{Math.round(batchProgress.current / batchProgress.total * 100)}%</span>
+              </div>
+              <div className="h-1.5 rounded-full overflow-hidden" style={{ background: 'rgba(255,255,255,0.08)' }}>
+                <div className="h-full rounded-full transition-all duration-500"
+                  style={{ width: `${batchProgress.current / batchProgress.total * 100}%`, background: '#FFB800' }} />
+              </div>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* ── Section 4: Results table ───────────────────────────────────────── */}
