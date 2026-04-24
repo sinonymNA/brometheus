@@ -277,14 +277,33 @@ export default function ParameterOptimizer({ get, post }) {
     const end   = useCustom ? customDates.end   : datePreset.end
     const body  = { start_date: start, end_date: end, symbols: ['SPY', 'QQQ', 'AAPL'], parameters: runParams }
     const resp  = await post('/api/backtest', body)
-    if (!resp?.job_id) return null
-    let status
-    do {
+    if (!resp?.job_id) {
+      console.warn('[Batch] POST failed')
+      return null
+    }
+    let status, maxPolls = 300, polls = 0
+    while (polls < maxPolls) {
       await new Promise(r => setTimeout(r, 2000))
       status = await get(`/api/backtest/${resp.job_id}`, { ttl: 0 })
-      if (status) setJobStatus(status)
-    } while (status && status.status === 'running')
-    return status?.status === 'done' ? status.result : null
+      polls++
+      if (!status) {
+        console.warn('[Batch] Poll #' + polls + ' returned null')
+        continue
+      }
+      if (status.status === 'done') {
+        console.log('[Batch] Done after ' + polls + ' polls')
+        setJobStatus(status)
+        return status.result
+      }
+      if (status.status === 'error') {
+        console.error('[Batch] Job error: ' + status.error)
+        setJobStatus(status)
+        return null
+      }
+      setJobStatus(status)
+    }
+    console.warn('[Batch] Max polls reached')
+    return null
   }, [useCustom, customDates, datePreset, post, get])
 
   const handleBatchRun = useCallback(async () => {
