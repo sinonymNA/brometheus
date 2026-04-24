@@ -8,7 +8,7 @@ import math
 import os
 import statistics
 import traceback
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional, Union
 
@@ -954,42 +954,81 @@ def _detect_market_regime(lab_runs: list[dict]) -> str:
     return "NEUTRAL"
 
 
+def _normalize_run(run: dict) -> dict:
+    """Return a frontend-ready flat dict from an internal run entry."""
+    r = run.get("result") or {}
+    ec_values = r.get("equity_curve") or []
+    dpnl_values = r.get("daily_pnl_history") or []
+
+    # Generate business dates to pair with the per-day lists
+    dates: list[str] = []
+    try:
+        d = date.fromisoformat(str(run.get("start_date", "")))
+        e = date.fromisoformat(str(run.get("end_date", "")))
+        while d <= e and len(dates) < max(len(ec_values), len(dpnl_values), 1):
+            if d.weekday() < 5:
+                dates.append(d.isoformat())
+            d += timedelta(days=1)
+    except (ValueError, TypeError):
+        pass
+
+    # equity_curve[0] = starting balance, equity_curve[1..] = end-of-day
+    equity_curve = [
+        {"date": dates[i] if i < len(dates) else str(i), "equity": v}
+        for i, v in enumerate(ec_values[1:])  # skip initial balance
+    ]
+    daily_pnl = [
+        {"date": dates[i] if i < len(dates) else str(i), "pnl": v}
+        for i, v in enumerate(dpnl_values)
+    ]
+
+    return {
+        "run_id": run.get("run_id", ""),
+        "created_at": run.get("created_at", ""),
+        "start_date": run.get("start_date", ""),
+        "end_date": run.get("end_date", ""),
+        "symbols": run.get("symbols", []),
+        "strategies": run.get("strategies", []),
+        "params": run.get("params", {}),
+        "status": run.get("status", "unknown"),
+        "ai_analysis": run.get("ai_analysis", ""),
+        "summary": {
+            "total_trades": r.get("total_trades", 0),
+            "win_rate": r.get("win_rate", 0),
+            "profit_factor": r.get("profit_factor", 0),
+            "total_return_pct": r.get("total_return_pct", 0),
+            "max_drawdown_pct": r.get("max_drawdown_pct", 0),
+            "sharpe_ratio": r.get("sharpe_ratio", 0),
+            "total_pnl": r.get("total_pnl", 0),
+            "strategy_breakdown": r.get("trades_by_strategy", {}),
+        },
+        "equity_curve": equity_curve,
+        "daily_pnl": daily_pnl,
+        "all_trades": r.get("all_trades", []),
+    }
+
+
 # ── Lab endpoints ─────────────────────────────────────────────────────────────
 
 
 @app.get("/api/lab/runs", tags=["lab"])
 async def lab_list_runs() -> dict:
-    runs_out = []
-    for run in reversed(_lab_runs[-20:]):
-        r = run.get("result") or {}
-        runs_out.append({
-            "run_id": run["run_id"],
-            "created_at": run.get("created_at", ""),
-            "start_date": run.get("start_date", ""),
-            "end_date": run.get("end_date", ""),
-            "symbols": run.get("symbols", []),
-            "strategies": run.get("strategies", []),
-            "params": run.get("params", {}),
-            "status": run.get("status", "unknown"),
-            "ai_analysis": run.get("ai_analysis", ""),
-            "summary": {
-                "total_trades": r.get("total_trades", 0),
-                "win_rate": r.get("win_rate", 0),
-                "profit_factor": r.get("profit_factor", 0),
-                "total_return_pct": r.get("total_return_pct", 0),
-                "max_drawdown_pct": r.get("max_drawdown_pct", 0),
-                "sharpe_ratio": r.get("sharpe_ratio", 0),
-            },
-        })
-    return {"runs": runs_out}
+    return {"runs": [_normalize_run(r) for r in reversed(_lab_runs[-20:])]}
 
 
 @app.get("/api/lab/runs/{run_id}", tags=["lab"])
 async def lab_get_run(run_id: str) -> dict:
     for run in _lab_runs:
         if run["run_id"] == run_id:
-            return {"run": run}
+            return _normalize_run(run)
     raise HTTPException(status_code=404, detail="Run not found")
+
+
+_LAB_PARAM_KEYS = {
+    "rsi_bull_threshold", "rsi_bear_threshold", "volume_ratio_min",
+    "iv_rank_max", "iv_rank_min", "signal_strength_min", "stop_loss_pct",
+    "profit_target_pct", "min_dte", "max_dte", "max_positions", "position_size_pct",
+}
 
 
 @app.post("/api/lab/backtest", tags=["lab"])
@@ -1024,7 +1063,7 @@ async def lab_start_backtest(body: dict) -> dict:
     if isinstance(symbols, str):
         symbols = [s.strip().upper() for s in symbols.split(",")]
     strategies = body.get("strategies", ["momentum", "iv_rank", "flow"])
-    raw_params = body.get("parameters", {}) or {}
+    raw_params = body.get("parameters") or {k: body[k] for k in _LAB_PARAM_KEYS if k in body}
 
     run_id = _uuid_lab.uuid4().hex
     job_id = _uuid_lab.uuid4().hex
@@ -1063,7 +1102,7 @@ async def lab_start_backtest(body: dict) -> dict:
 
             result = await engine.run(start_date_obj, end_date_obj, progress_cb=_progress, params=bt_params)
             result_dict = result.to_dict()
-            _backtest_jobs[job_id].update({"status": "done", "progress": 100, "result": result_dict})
+            _backtest_jobs[job_id].update({"status": "done", "progress": 100, "result": result_dict, "run_id": run_id})
             run_entry["status"] = "done"
             run_entry["result"] = result_dict
             # Trigger AI analysis

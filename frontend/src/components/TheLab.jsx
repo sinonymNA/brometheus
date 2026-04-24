@@ -381,7 +381,11 @@ function RunnerTab({ params, onParamChange, runs, selectedRun, onSelectRun, onRu
       {/* Right: run history */}
       <div className="w-64 flex flex-col gap-2 flex-shrink-0">
         <span className="text-xs muted uppercase tracking-widest px-1">Run History ({runs.length})</span>
-        {runs.length === 0 && <div className="text-xs muted p-3 text-center card">No runs yet</div>}
+        {runs.length === 0 && (
+          <div className="card p-3 flex flex-col gap-1.5">
+            <div className="text-xs muted">No runs yet. Configure parameters and date range, then hit <strong style={{color:'#00D9FF'}}>Run Backtest</strong>.</div>
+          </div>
+        )}
         <div className="flex flex-col gap-1.5 overflow-y-auto">
           {[...runs].reverse().map(r => (
             <RunItem key={r.run_id} run={r} selected={selectedRun?.run_id===r.run_id} onClick={()=>onSelectRun(r)} />
@@ -394,7 +398,7 @@ function RunnerTab({ params, onParamChange, runs, selectedRun, onSelectRun, onRu
 
 // ── AnalyzerTab ───────────────────────────────────────────────────────────────
 
-function AnalyzerTab({ run, prevRun, onAsk, aiResponse, aiLoading, post }) {
+function AnalyzerTab({ run, prevRun, runs, onSelectRun, onAsk, aiResponse, aiLoading, post }) {
   const [question, setQuestion] = useState('')
   const [chatHistory, setChatHistory] = useState([])
   const [streaming, setStreaming]     = useState(false)
@@ -459,13 +463,48 @@ function AnalyzerTab({ run, prevRun, onAsk, aiResponse, aiLoading, post }) {
   }
 
   if (!run) return (
-    <div className="flex items-center justify-center h-64 text-sm muted">
-      Run a backtest first, then select it from the history to analyze.
+    <div className="flex flex-col items-center justify-center gap-4 h-64">
+      <div className="text-xs muted text-center">
+        No run selected. Go to <strong style={{color:'#00D9FF'}}>▶ Backtest Runner</strong> to run your first backtest, then come back here.
+      </div>
+      {runs?.length > 0 && (
+        <div className="flex flex-col gap-1 w-72">
+          <span className="text-xs muted uppercase tracking-widest text-center">Or pick a previous run:</span>
+          {[...runs].reverse().slice(0, 5).map(r => (
+            <RunItem key={r.run_id} run={r} selected={false} onClick={() => onSelectRun(r)} />
+          ))}
+        </div>
+      )}
     </div>
   )
 
   return (
     <div className="flex flex-col gap-4 overflow-y-auto">
+      {/* Run selector header */}
+      {runs?.length > 1 && (
+        <div className="flex items-center gap-2 p-2 rounded" style={{background:'rgba(255,255,255,0.03)',border:'1px solid rgba(255,255,255,0.08)'}}>
+          <span className="text-xs muted flex-shrink-0">Viewing:</span>
+          <select
+            value={run.run_id}
+            onChange={e => {
+              const r = runs.find(x => x.run_id === e.target.value)
+              if (r) onSelectRun(r)
+            }}
+            className="text-xs flex-1 px-2 py-1 rounded"
+            style={{background:'rgba(255,255,255,0.06)',border:'1px solid rgba(255,255,255,0.15)',color:'#E8EAED'}}>
+            {[...runs].reverse().map(r => {
+              const ret = ((r.summary?.total_return_pct??0)*100).toFixed(1)
+              const sign = parseFloat(ret) >= 0 ? '+' : ''
+              return (
+                <option key={r.run_id} value={r.run_id} style={{background:'#0D1220'}}>
+                  {r.start_date?.slice(0,7)} → {r.end_date?.slice(0,7)} | {sign}{ret}% | WR {((r.summary?.win_rate??0)*100).toFixed(0)}% | PF {(r.summary?.profit_factor??0).toFixed(2)}
+                </option>
+              )
+            })}
+          </select>
+          {run.ai_analysis && <span className="text-xs" style={{color:'#00FF88'}}>✦ AI Ready</span>}
+        </div>
+      )}
       {/* Metric cards */}
       <div className="grid grid-cols-6 gap-2">
         <MetricCard label="Total Return"  value={(s.total_return_pct??0)*100}  prev={ps.total_return_pct!=null?(ps.total_return_pct)*100:null} fmt={v=>v.toFixed(1)+'%'} better="high"/>
@@ -587,11 +626,7 @@ function AnalyzerTab({ run, prevRun, onAsk, aiResponse, aiLoading, post }) {
                   ? {background:'rgba(0,217,255,0.08)',color:'#00D9FF',alignSelf:'flex-end',maxWidth:'80%',border:'1px solid rgba(0,217,255,0.2)'}
                   : {background:'rgba(0,255,136,0.06)',color:'#E8EAED',border:'1px solid rgba(0,255,136,0.15)',lineHeight:1.5}
                 }>
-                {renderContent ? m.text.split(/(\*\*[^*]+\*\*)/).map((p,j)=>
-                  p.startsWith('**')&&p.endsWith('**')
-                    ? <strong key={j} style={{color:'#00FF88'}}>{p.slice(2,-2)}</strong>
-                    : <span key={j}>{p}</span>
-                ) : m.text}
+                {renderContent(m.text)}
               </div>
             ))}
             {streaming && (
@@ -844,15 +879,25 @@ export default function TheLab({ get, post }) {
       while (polls < 300) {
         await new Promise(r => setTimeout(r, 1000))
         polls++
-        const status = await get(`/api/backtest/status/${job_id}`)
+        const status = await get(`/api/backtest/${job_id}`)
         if (!status) continue
-        if (status.progress != null) { setProgress(Math.round(status.progress*100)); setProgressMsg(status.message||'Running…') }
+        if (status.progress != null) { setProgress(status.progress || 0); setProgressMsg(status.message||'Running…') }
         if (status.status === 'done') {
-          const full = await get(`/api/lab/runs/${status.run_id || job_id}`)
-          if (full) {
-            setRuns(prev => [...prev, full])
+          const runId = status.run_id || job_id
+          const full = await get(`/api/lab/runs/${runId}`)
+          if (full && full.run_id) {
+            const addRun = r => setRuns(prev => {
+              const exists = prev.find(x => x.run_id === r.run_id)
+              return exists ? prev.map(x => x.run_id === r.run_id ? r : x) : [...prev, r]
+            })
+            addRun(full)
             setSelectedRun(full)
             setActiveTab('analyzer')
+            // Re-fetch after delay to pick up AI analysis which runs async after done
+            setTimeout(async () => {
+              const refreshed = await get(`/api/lab/runs/${runId}`)
+              if (refreshed?.run_id) { addRun(refreshed); setSelectedRun(refreshed) }
+            }, 8000)
           }
           break
         }
@@ -910,6 +955,7 @@ export default function TheLab({ get, post }) {
           <div className="h-full overflow-y-auto pr-1">
             <AnalyzerTab
               run={selectedRun} prevRun={prevRun}
+              runs={runs} onSelectRun={setSelectedRun}
               aiResponse={aiResponse} aiLoading={aiLoading} post={post}
             />
           </div>
@@ -920,7 +966,7 @@ export default function TheLab({ get, post }) {
           </div>
         )}
         {activeTab === 'chat' && (
-          <TheLabChat get={get} post={post} runs={runs} />
+          <TheLabChat get={get} labRuns={runs} currentParams={params} />
         )}
       </div>
     </div>
