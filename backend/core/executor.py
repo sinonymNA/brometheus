@@ -32,9 +32,23 @@ _EOD_CLOSE_TIME = time(15, 45)   # start closing at 3:45 PM ET
 _PROFIT_TARGET_PCT  =  0.30   # close long at +30 %
 _STOP_LOSS_PCT      = -0.15   # close long at −15 %
 
+# Scale-out thresholds (Fix 2)
+_SCALE_OUT_1_PCT    =  0.20   # close 50 % at +20 %
+_SCALE_OUT_2_PCT    =  0.40   # close remaining 50 % at +40 %
+
+# Time-based stop (Fix 4)
+_TIME_STOP_DAYS     =  5      # max days a directional trade may be open
+_TIME_STOP_MIN_GAIN =  0.05   # if gain < this after _TIME_STOP_DAYS, exit
+
 # iv_rank condor thresholds
 _CONDOR_PROFIT_PCT  =  0.50   # close condor when 50 % of premium collected
 _CONDOR_MAX_LOSS    =  2.0    # close condor when loss = 2× premium (MAX_LOSS_MULTIPLIER)
+
+# Trading-window boundaries ET (Fix 5)
+_WINDOW_OPEN_1  = time(9,  45)
+_WINDOW_CLOSE_1 = time(11, 30)
+_WINDOW_OPEN_2  = time(14,  0)
+_WINDOW_CLOSE_2 = time(15, 30)
 
 
 # ── Result model ──────────────────────────────────────────────────────────────
@@ -69,6 +83,8 @@ class TradeExecutor:
         self._storage = storage
         self._risk_manager = risk_manager
         self._sizer = position_sizer
+        # Tracks partial scale-out state: trade_id → {qty_remaining, breakeven}
+        self._partial_state: dict[int, dict] = {}
 
     # ── Execute ───────────────────────────────────────────────────────────────
 
@@ -85,6 +101,14 @@ class TradeExecutor:
         """
         symbol = signal.get("symbol", "")
         is_condor = "legs" in signal
+
+        # Pre-market filter: only enter new positions in the two valid ET windows.
+        if not self._in_trading_window():
+            return ExecutionResult(
+                approved=False,
+                reason="Outside trading window (9:45–11:30 or 14:00–15:30 ET)",
+                symbol=symbol,
+            )
 
         # Determine per-share option price
         if is_condor:
@@ -120,12 +144,13 @@ class TradeExecutor:
         if not risk.allowed:
             return ExecutionResult(approved=False, reason=risk.reason, symbol=symbol)
 
-        # 2. Position size
+        # 2. Position size (ATR ratio from momentum signals; defaults to 1.0 for others)
         size = await self._sizer.calculate(
             strength=float(signal.get("strength", 0.5)),
             option_price=option_price,
             account_equity=equity,
             daily_pnl=risk.daily_pnl,
+            atr_ratio=float(signal.get("atr_ratio", 1.0)),
         )
         if size.contracts == 0:
             return ExecutionResult(
@@ -142,7 +167,7 @@ class TradeExecutor:
 
     # ── Close trade ───────────────────────────────────────────────────────────
 
-    async def close_trade(self, trade_id: int, reason: str) -> ExecutionResult:
+    async def close_trade(self, trade_id: int, reason: str, qty_override: int | None = None) -> ExecutionResult:
         """Close an open trade by placing a closing limit order.
 
         Args:
@@ -160,6 +185,7 @@ class TradeExecutor:
 
         symbol = trade["symbol"]
         action = trade.get("action", "buy")
+        qty = qty_override if qty_override is not None else int(trade.get("quantity", 1) or 1)
 
         # Current option price from DB cache
         current_price = await self._option_mid(
@@ -174,7 +200,6 @@ class TradeExecutor:
 
         exit_price = round(current_price, 2)
         entry = float(trade["entry_price"])
-        qty = int(trade["quantity"])
 
         # Closing order (reverse of opening)
         close_side = OrderSide.SELL if action == "buy" else OrderSide.BUY
@@ -438,11 +463,13 @@ class TradeExecutor:
         if trade.get("expiry"):
             dte = (trade["expiry"] - date.today()).days
             if dte <= 1:
+                self._partial_state.pop(trade_id, None)
                 await self.close_trade(trade_id, "expiry")
                 return
 
         # EOD check
         if eod:
+            self._partial_state.pop(trade_id, None)
             await self.close_trade(trade_id, "EOD")
             return
 
@@ -462,7 +489,7 @@ class TradeExecutor:
         cost_basis = entry * qty * 100
 
         if strategy == "iv_rank" and action == "sell":
-            # Condor: profit = premium decay; entry_price is net credit received
+            # ── Iron condor: profit = premium decay ───────────────────────────
             unrealized_pnl = (entry - current) * qty * 100
             profit_pct = unrealized_pnl / cost_basis if cost_basis > 0 else 0.0
 
@@ -470,15 +497,58 @@ class TradeExecutor:
                 await self.close_trade(trade_id, "profit target")
             elif unrealized_pnl <= -(entry * _CONDOR_MAX_LOSS * qty * 100):
                 await self.close_trade(trade_id, "stop loss")
+
         else:
-            # Directional long: entry was a buy
+            # ── Directional long ──────────────────────────────────────────────
             unrealized_pnl = (current - entry) * qty * 100
             profit_pct = unrealized_pnl / cost_basis if cost_basis > 0 else 0.0
 
-            if profit_pct >= _PROFIT_TARGET_PCT:
-                await self.close_trade(trade_id, "profit target")
-            elif profit_pct <= _STOP_LOSS_PCT:
-                await self.close_trade(trade_id, "stop loss")
+            # Time-based stop: if open > 5 days with < 5% gain, exit dead money.
+            entry_ts = trade.get("created_at") or trade.get("opened_at") or trade.get("entry_time")
+            if entry_ts is not None and trade_id not in self._partial_state:
+                try:
+                    if isinstance(entry_ts, str):
+                        entry_dt = datetime.fromisoformat(entry_ts.replace("Z", "+00:00"))
+                    else:
+                        entry_dt = entry_ts if entry_ts.tzinfo else entry_ts.replace(tzinfo=timezone.utc)
+                    days_open = (datetime.now(timezone.utc) - entry_dt).days
+                    if days_open >= _TIME_STOP_DAYS and profit_pct < _TIME_STOP_MIN_GAIN:
+                        await self.close_trade(trade_id, f"time stop ({days_open}d, {profit_pct:.1%} gain)")
+                        return
+                except Exception:
+                    pass  # malformed timestamp — skip time stop for this trade
+
+            if trade_id in self._partial_state:
+                # ── Second stage: monitor remaining 50% after scale-out ───────
+                state = self._partial_state[trade_id]
+                remaining_qty = state["qty_remaining"]
+                breakeven = state["breakeven"]   # = original entry_price
+
+                if profit_pct >= _SCALE_OUT_2_PCT:
+                    del self._partial_state[trade_id]
+                    await self.close_trade(trade_id, "scale-out final (40%)", qty_override=remaining_qty)
+                elif current <= breakeven:
+                    del self._partial_state[trade_id]
+                    await self.close_trade(trade_id, "breakeven stop", qty_override=remaining_qty)
+                elif profit_pct <= _STOP_LOSS_PCT:
+                    del self._partial_state[trade_id]
+                    await self.close_trade(trade_id, "stop loss", qty_override=remaining_qty)
+
+            else:
+                # ── First stage: normal monitoring ────────────────────────────
+                if profit_pct >= _SCALE_OUT_1_PCT and qty >= 2:
+                    # Close 50%, move stop to breakeven on the rest.
+                    close_qty = max(1, qty // 2)
+                    remaining_qty = qty - close_qty
+                    await self._close_partial_position(trade, close_qty, current, "scale-out 50% (20%)")
+                    self._partial_state[trade_id] = {
+                        "qty_remaining": remaining_qty,
+                        "breakeven": entry,
+                    }
+                elif profit_pct >= _PROFIT_TARGET_PCT:
+                    await self.close_trade(trade_id, "profit target")
+                elif profit_pct <= _STOP_LOSS_PCT:
+                    await self.close_trade(trade_id, "stop loss")
 
     async def _option_mid(
         self,
@@ -514,6 +584,65 @@ class TradeExecutor:
             return round((bid + ask) / 2, 4)
         val = bid or ask
         return round(val, 4) if val > 0 else None
+
+    async def _close_partial_position(
+        self,
+        trade: dict[str, Any],
+        close_qty: int,
+        current_price: float,
+        reason: str,
+    ) -> None:
+        """Place a limit sell for *close_qty* contracts without closing the DB record.
+
+        The remaining quantity is tracked in ``self._partial_state``; the DB
+        trade stays open and is fully closed when the second exit fires.
+        """
+        symbol  = trade["symbol"]
+        expiry  = trade.get("expiry")
+        opt     = trade.get("option_type") or "call"
+        strike  = float(trade.get("strike") or 0)
+        entry   = float(trade.get("entry_price") or 0)
+
+        try:
+            if strike and expiry:
+                occ = _occ(symbol, expiry, opt, strike)
+                await self._alpaca.place_limit_order(
+                    symbol=occ,
+                    qty=float(close_qty),
+                    side=OrderSide.SELL,
+                    limit_price=round(current_price, 2),
+                    time_in_force=TimeInForce.DAY,
+                )
+        except Exception as exc:
+            logger.error("_close_partial_position: order failed for trade %s: %s", trade.get("id"), exc)
+            return
+
+        partial_pnl = (current_price - entry) * close_qty * 100
+        logger.info(
+            "Scale-out 50%%: trade=%s  closed=%d contracts  pnl=%+.2f  reason=%s",
+            trade.get("id"), close_qty, partial_pnl, reason,
+        )
+        await self.discord_alert("CLOSED", {
+            "symbol":      symbol,
+            "pnl_dollars": round(partial_pnl, 2),
+            "pnl_pct":     round((current_price / entry - 1) * 100, 1) if entry > 0 else 0,
+            "reason":      f"{reason} (partial: {close_qty} contracts)",
+            "strategy":    trade.get("strategy", ""),
+        })
+
+    @staticmethod
+    def _in_trading_window() -> bool:
+        """Return True during the two valid entry windows in ET.
+
+        Window 1: 09:45 – 11:30 (open drive, first hour momentum)
+        Window 2: 14:00 – 15:30 (afternoon trend continuation)
+        Lunch lull (11:30 – 14:00) and late session (15:30+) are excluded.
+        """
+        now = datetime.now(_ET).time()
+        return (
+            _WINDOW_OPEN_1 <= now <= _WINDOW_CLOSE_1
+            or _WINDOW_OPEN_2 <= now <= _WINDOW_CLOSE_2
+        )
 
     @staticmethod
     def _signal_expiry(signal: dict[str, Any]) -> date | None:

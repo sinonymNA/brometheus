@@ -20,6 +20,26 @@ from backend.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _compute_atr_ratio(bars: list) -> float:
+    """Return current_TR / 14-bar_avg_TR using the bars already fetched.
+
+    Values > 1 indicate above-average volatility (reduce position size).
+    Returns 1.0 when there are fewer than 16 bars (no adjustment).
+    """
+    if len(bars) < 16:
+        return 1.0
+    trs: list[float] = []
+    for i in range(1, len(bars)):
+        h  = float(getattr(bars[i],     "high",  bars[i].close))
+        lo = float(getattr(bars[i],     "low",   bars[i].close))
+        pc = float(getattr(bars[i - 1], "close", 0) or bars[i].close)
+        trs.append(max(h - lo, abs(h - pc), abs(lo - pc)))
+    if len(trs) < 14:
+        return 1.0
+    avg_atr = sum(trs[-14:]) / 14.0
+    return trs[-1] / avg_atr if avg_atr > 0 else 1.0
+
+
 class MomentumStrategy(BaseStrategy):
     """Buy calls/puts on confirmed momentum breakouts with low IV."""
 
@@ -33,6 +53,8 @@ class MomentumStrategy(BaseStrategy):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.near_misses: collections.deque = collections.deque(maxlen=100)
+        self._spy_ma50_ts: datetime | None = None
+        self._spy_ma50_result: bool | None = None
 
     async def scan(self) -> list[dict[str, Any]]:
         """Scan all symbols and return signals for untraded symbols that qualify."""
@@ -93,6 +115,15 @@ class MomentumStrategy(BaseStrategy):
             and current < low_10
             and iv_rank <= self.IV_RANK_MAX
         )
+
+        # Trend filter: only trade WITH the SPY 50-day MA.
+        # None = data unavailable → no filter applied (fail-open).
+        spy_above_ma50 = await self._get_spy_above_ma50()
+        if spy_above_ma50 is not None:
+            if spy_above_ma50 and bear:
+                return None   # SPY in uptrend — skip put signals
+            if not spy_above_ma50 and bull:
+                return None   # SPY in downtrend — skip call signals
 
         if not (bull or bear):
             # Near-miss detection
@@ -157,6 +188,8 @@ class MomentumStrategy(BaseStrategy):
             logger.debug("MomentumStrategy: no option found for %s %s", symbol, direction)
             return None
 
+        atr_ratio = _compute_atr_ratio(bars)
+
         return {
             "symbol": symbol,
             "direction": direction,
@@ -166,9 +199,47 @@ class MomentumStrategy(BaseStrategy):
             "rsi": round(rsi, 2),
             "volume_ratio": round(volume_ratio, 3),
             "iv_rank": round(iv_rank, 1),
+            "atr_ratio": round(atr_ratio, 3),
             "spot_price": current,
             **option,
         }
+
+    async def _get_spy_above_ma50(self) -> bool | None:
+        """Return True if SPY close > 50-day MA, False if below, None if data unavailable.
+
+        Result is cached for 30 minutes so the daily bar fetch only fires once
+        per scan cycle rather than once per symbol.
+        """
+        now = datetime.now(timezone.utc)
+        if (
+            self._spy_ma50_ts is not None
+            and (now - self._spy_ma50_ts).total_seconds() < 1800
+        ):
+            return self._spy_ma50_result
+
+        try:
+            start = now - timedelta(days=90)   # ~64 trading days
+            raw = await self.alpaca.get_bars(["SPY"], timeframe="1Day", start=start)
+            daily_bars = raw.get("SPY", [])
+            if len(daily_bars) < 52:
+                logger.debug("SPY trend: only %d daily bars — filter disabled", len(daily_bars))
+                self._spy_ma50_result = None
+                self._spy_ma50_ts = now
+                return None
+            closes = [float(b.close) for b in daily_bars[-51:]]
+            ma50 = sum(closes[-50:]) / 50.0
+            self._spy_ma50_result = closes[-1] > ma50
+            self._spy_ma50_ts = now
+            logger.debug(
+                "SPY trend: price=%.2f  MA50=%.2f  above=%s",
+                closes[-1], ma50, self._spy_ma50_result,
+            )
+        except Exception as exc:
+            logger.warning("SPY trend check failed (filter disabled): %s", exc)
+            self._spy_ma50_result = None
+            self._spy_ma50_ts = now
+
+        return self._spy_ma50_result
 
     async def calculate_rsi(self, bars: list, period: int = 14) -> float:
         """Compute RSI(*period*) for the last bar in *bars*.

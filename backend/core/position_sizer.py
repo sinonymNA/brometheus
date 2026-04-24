@@ -78,6 +78,7 @@ class PositionSizer:
         option_price: float,
         account_equity: float,
         daily_pnl: float = 0.0,
+        atr_ratio: float = 1.0,
     ) -> SizeResult:
         """Size a position in five steps using the half-Kelly criterion.
 
@@ -143,6 +144,12 @@ class PositionSizer:
         signal_strength = max(0.0, min(float(strength), 1.0))
         kelly_fraction = max(0.0, min(kelly_raw * 0.5 * signal_strength, MAX_RISK_PER_TRADE_PCT))
 
+        # ATR volatility scaling: high ATR → smaller position.
+        # atr_ratio = current_TR / avg_TR_14; ratio > 1 means above-average volatility.
+        # Multiplier is clamped so we never go below half-size or above double.
+        atr_mult = max(0.5, min(1.0 / max(float(atr_ratio), 0.25), 2.0))
+        kelly_fraction = min(kelly_fraction * atr_mult, MAX_RISK_PER_TRADE_PCT)
+
         if kelly_fraction == 0.0:
             return SizeResult(
                 contracts=0,
@@ -179,6 +186,7 @@ class PositionSizer:
             reason=(
                 f"half-Kelly={kelly_fraction:.4f}  "
                 f"(raw f*={kelly_raw:.4f})  "
+                f"atr_mult={atr_mult:.2f}  "
                 f"budget=${risk_budget:.2f}"
             ),
         )
