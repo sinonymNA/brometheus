@@ -10,6 +10,7 @@ import PipelineStatus from './components/PipelineStatus.jsx'
 import BacktestUI from './components/BacktestUI.jsx'
 import ParameterOptimizer from './components/ParameterOptimizer.jsx'
 import NearMisses from './components/NearMisses.jsx'
+import TheLab from './components/TheLab.jsx'
 import {
   formatMoney, formatPercent, formatPct, formatTime, formatNumber
 } from './utils/formatting.js'
@@ -169,6 +170,7 @@ export default function App() {
             { id: 'live', label: '● Live' },
             { id: 'backtest', label: '◈ Backtest' },
             { id: 'optimizer', label: '⚙ Optimizer' },
+            { id: 'lab',       label: '✦ The Lab' },
           ].map(({ id, label }) => (
             <button
               key={id}
@@ -325,6 +327,10 @@ export default function App() {
 
           {tab === 'optimizer' && (
             <ParameterOptimizer get={get} post={post} />
+          )}
+
+          {tab === 'lab' && (
+            <TheLab get={get} post={post} />
           )}
         </main>
       </div>

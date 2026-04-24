@@ -12,10 +12,12 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional, Union
 
+import uuid as _uuid_lab
+
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -186,6 +188,19 @@ async def on_startup() -> None:
                 app.state.risk_manager = _RM()
         except Exception:
             pass
+
+    # Initialize AI Analyzer
+    openai_key = os.getenv("OPENAI_API_KEY", "")
+    app.state.ai_analyzer = None
+    if openai_key:
+        try:
+            from backend.integrations.openai_analyzer import AIAnalyzer
+            app.state.ai_analyzer = AIAnalyzer(openai_key)
+            logger.info("AIAnalyzer initialized with OpenAI")
+        except Exception as exc:
+            logger.warning("AIAnalyzer init failed: %s", exc)
+    else:
+        logger.info("OPENAI_API_KEY not set — AI features disabled")
 
     app.state.ready = True
     logger.info("APEX CRUSHER IS LIVE")
@@ -736,6 +751,8 @@ async def _opt_mid(symbol: str) -> float | None:
 # ── Backtesting ───────────────────────────────────────────────────────────────
 
 _backtest_jobs: dict[str, dict] = {}   # job_id → {status, progress, result, error}
+_lab_runs: list[dict] = []   # persists in memory; each entry is a full lab run
+_lab_job_to_run: dict[str, str] = {}  # job_id → run_id mapping
 
 
 @app.post("/api/backtest/clear-cache", tags=["backtest"])
@@ -916,6 +933,232 @@ async def get_backtest(job_id: str) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+# ── Lab helpers ───────────────────────────────────────────────────────────────
+
+
+def _detect_market_regime(lab_runs: list[dict]) -> str:
+    if not lab_runs:
+        return "NEUTRAL"
+    last = lab_runs[-1]
+    end_date_val = last.get("end_date", "")
+    try:
+        end_year = int(str(end_date_val)[:4])
+        if end_year == 2022:
+            return "BEAR"
+        if end_year >= 2023:
+            return "BULL"
+    except (ValueError, TypeError):
+        pass
+    return "NEUTRAL"
+
+
+# ── Lab endpoints ─────────────────────────────────────────────────────────────
+
+
+@app.get("/api/lab/runs", tags=["lab"])
+async def lab_list_runs() -> dict:
+    runs_out = []
+    for run in reversed(_lab_runs[-20:]):
+        r = run.get("result") or {}
+        runs_out.append({
+            "run_id": run["run_id"],
+            "created_at": run.get("created_at", ""),
+            "start_date": run.get("start_date", ""),
+            "end_date": run.get("end_date", ""),
+            "symbols": run.get("symbols", []),
+            "strategies": run.get("strategies", []),
+            "params": run.get("params", {}),
+            "status": run.get("status", "unknown"),
+            "ai_analysis": run.get("ai_analysis", ""),
+            "summary": {
+                "total_trades": r.get("total_trades", 0),
+                "win_rate": r.get("win_rate", 0),
+                "profit_factor": r.get("profit_factor", 0),
+                "total_return_pct": r.get("total_return_pct", 0),
+                "max_drawdown_pct": r.get("max_drawdown_pct", 0),
+                "sharpe_ratio": r.get("sharpe_ratio", 0),
+            },
+        })
+    return {"runs": runs_out}
+
+
+@app.get("/api/lab/runs/{run_id}", tags=["lab"])
+async def lab_get_run(run_id: str) -> dict:
+    for run in _lab_runs:
+        if run["run_id"] == run_id:
+            return {"run": run}
+    raise HTTPException(status_code=404, detail="Run not found")
+
+
+@app.post("/api/lab/backtest", tags=["lab"])
+async def lab_start_backtest(body: dict) -> dict:
+    preset_map = {
+        "2023_full": {"start_date": "2023-01-03", "end_date": "2023-12-29"},
+        "2022_bear": {"start_date": "2022-01-03", "end_date": "2022-12-30"},
+        "ytd": {"start_date": f"{date.today().year}-01-02", "end_date": date.today().isoformat()},
+    }
+
+    if "preset" in body:
+        preset_name = body["preset"]
+        if preset_name not in preset_map:
+            return {"error": f"Unknown preset '{preset_name}'. Valid: {list(preset_map.keys())}"}
+        preset_data = preset_map[preset_name]
+        start_date_str = preset_data["start_date"]
+        end_date_str = preset_data["end_date"]
+    else:
+        start_date_str = body.get("start_date")
+        end_date_str = body.get("end_date")
+
+    if not start_date_str or not end_date_str:
+        return {"error": "Missing start_date and/or end_date. Provide as strings (YYYY-MM-DD) or use a preset name."}
+
+    try:
+        start_date_obj = date.fromisoformat(start_date_str) if isinstance(start_date_str, str) else start_date_str
+        end_date_obj = date.fromisoformat(end_date_str) if isinstance(end_date_str, str) else end_date_str
+    except (ValueError, AttributeError) as e:
+        return {"error": f"Invalid date format: {e}. Use YYYY-MM-DD (e.g., 2024-03-01)"}
+
+    symbols = body.get("symbols", ["SPY", "QQQ", "AAPL"])
+    if isinstance(symbols, str):
+        symbols = [s.strip().upper() for s in symbols.split(",")]
+    strategies = body.get("strategies", ["momentum", "iv_rank", "flow"])
+    raw_params = body.get("parameters", {}) or {}
+
+    run_id = _uuid_lab.uuid4().hex
+    job_id = _uuid_lab.uuid4().hex
+
+    run_entry = {
+        "run_id": run_id,
+        "job_id": job_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "start_date": start_date_str,
+        "end_date": end_date_str,
+        "symbols": symbols,
+        "strategies": strategies,
+        "params": raw_params,
+        "status": "running",
+        "result": None,
+        "ai_analysis": "",
+    }
+    _lab_runs.append(run_entry)
+    _lab_job_to_run[job_id] = run_id
+    _backtest_jobs[job_id] = {"status": "running", "progress": 0, "message": "Starting…", "result": None, "error": None}
+
+    async def _run_lab() -> None:
+        try:
+            from backend.backtesting.data_loader import HistoricalDataLoader
+            from backend.backtesting.engine import BacktestEngine, BacktestParams
+            alpaca = app.state.alpaca
+            if alpaca is None:
+                raise RuntimeError("Alpaca client not initialised")
+            bt_params = BacktestParams.from_dict(raw_params)
+            loader = HistoricalDataLoader(alpaca)
+            engine = BacktestEngine(loader, symbols, strategies)
+
+            async def _progress(pct: int, msg: str) -> None:
+                _backtest_jobs[job_id]["progress"] = pct
+                _backtest_jobs[job_id]["message"] = msg
+
+            result = await engine.run(start_date_obj, end_date_obj, progress_cb=_progress, params=bt_params)
+            result_dict = result.to_dict()
+            _backtest_jobs[job_id].update({"status": "done", "progress": 100, "result": result_dict})
+            run_entry["status"] = "done"
+            run_entry["result"] = result_dict
+            # Trigger AI analysis
+            ai = getattr(app.state, "ai_analyzer", None)
+            if ai is not None:
+                try:
+                    prev_runs = [r for r in _lab_runs if r["run_id"] != run_id and r.get("status") == "done"]
+                    analysis = await ai.analyze_backtest(run_entry, prev_runs)
+                    run_entry["ai_analysis"] = analysis
+                except Exception as exc:
+                    logger.warning("Lab AI analysis failed: %s", exc)
+        except Exception as exc:
+            logger.exception("Lab backtest job %s failed", job_id)
+            _backtest_jobs[job_id].update({"status": "error", "error": str(exc)})
+            run_entry["status"] = "error"
+
+    asyncio.create_task(_run_lab())
+    return {"job_id": job_id, "run_id": run_id}
+
+
+@app.post("/api/lab/chat", tags=["lab"])
+async def lab_chat(body: dict) -> StreamingResponse:
+    question = body.get("question", "").strip()
+    current_params = body.get("current_params", {})
+    if not question:
+        async def _empty():
+            yield "data: " + json.dumps({"text": "(empty question)"}) + "\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(_empty(), media_type="text/event-stream")
+
+    ai = getattr(app.state, "ai_analyzer", None)
+    completed_runs = [r for r in _lab_runs if r.get("status") == "done"]
+    market_regime = _detect_market_regime(completed_runs)
+
+    if ai is None:
+        async def _no_ai():
+            yield "data: " + json.dumps({"text": "AI is not configured. Add OPENAI_API_KEY to your environment variables."}) + "\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(_no_ai(), media_type="text/event-stream")
+
+    async def _stream():
+        async for chunk in ai.stream_answer(question, completed_runs[-20:], current_params, market_regime):
+            yield "data: " + json.dumps({"text": chunk}) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(_stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
+
+@app.get("/api/lab/recommendations", tags=["lab"])
+async def lab_recommendations() -> dict:
+    ai = getattr(app.state, "ai_analyzer", None)
+    completed = [r for r in _lab_runs if r.get("status") == "done"]
+    regime = _detect_market_regime(completed)
+    if ai is None:
+        return {"error": "AI not configured", "market_regime": regime}
+    result = await ai.get_recommendations(completed, regime)
+    result["market_regime"] = regime
+    return result
+
+
+@app.post("/api/lab/predict", tags=["lab"])
+async def lab_predict(body: dict) -> dict:
+    parameters = body.get("parameters", {})
+    ai = getattr(app.state, "ai_analyzer", None)
+    completed = [r for r in _lab_runs if r.get("status") == "done"]
+    if ai is None:
+        return {"error": "AI not configured"}
+    return await ai.evaluate_parameters(parameters, completed)
+
+
+@app.get("/api/lab/stats", tags=["lab"])
+async def lab_stats() -> dict:
+    completed = [r for r in _lab_runs if r.get("status") == "done"]
+    best = None
+    best_pf = 0.0
+    for run in completed:
+        pf = (run.get("result") or {}).get("profit_factor", 0) or 0
+        if pf > best_pf:
+            best_pf = pf
+            best = run
+    regime = _detect_market_regime(completed)
+    ai_available = getattr(app.state, "ai_analyzer", None) is not None
+    return {
+        "total_backtests": len(completed),
+        "combos_tested": len(set(json.dumps(r.get("params", {}), sort_keys=True) for r in completed)),
+        "market_regime": regime,
+        "ai_available": ai_available,
+        "best_run": {
+            "run_id": best["run_id"],
+            "profit_factor": best_pf,
+            "win_rate": (best.get("result") or {}).get("win_rate", 0),
+            "total_return_pct": (best.get("result") or {}).get("total_return_pct", 0),
+            "params": best.get("params", {}),
+        } if best else None,
+    }
 
 
 # ── Bot parameter management ───────────────────────────────────────────────────

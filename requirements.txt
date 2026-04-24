@@ -17,3 +17,4 @@ yfinance
 pytest
 pytest-asyncio
 httpx
+openai>=1.0.0

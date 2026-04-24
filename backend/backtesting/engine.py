@@ -101,6 +101,7 @@ class BacktestResult:
     worst_day: dict
     signals_generated: int
     signals_acted_on: int
+    all_trades: list[dict]
     start_date: date
     end_date: date
     duration_days: int
@@ -712,6 +713,20 @@ class BacktestEngine:
         best_day_key = max(daily_pnl_by_date, key=daily_pnl_by_date.get, default=None) if daily_pnl_by_date else None
         worst_day_key = min(daily_pnl_by_date, key=daily_pnl_by_date.get, default=None) if daily_pnl_by_date else None
 
+        def _trade_row(t: _BacktestTrade) -> dict:
+            return {
+                "id": t.id, "symbol": t.symbol, "strategy": t.strategy,
+                "action": t.action, "option_type": t.option_type,
+                "strike": t.strike, "expiry": t.expiry.isoformat() if hasattr(t.expiry, 'isoformat') else str(t.expiry),
+                "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
+                "quantity": t.quantity,
+                "pnl": t.pnl,
+                "entry_time": t.entry_time.isoformat() if t.entry_time else None,
+                "exit_time": t.exit_time.isoformat() if t.exit_time else None,
+                "exit_reason": t.exit_reason,
+            }
+
         return BacktestResult(
             total_trades=len(closed_trades),
             winning_trades=len(wins),
@@ -735,6 +750,7 @@ class BacktestEngine:
             worst_day={"date": worst_day_key, "pnl": daily_pnl_by_date.get(worst_day_key, 0.0)} if worst_day_key else {},
             signals_generated=signals_generated,
             signals_acted_on=signals_acted_on,
+            all_trades=[_trade_row(t) for t in closed_trades[-200:]],
             start_date=start_date,
             end_date=end_date,
             duration_days=(end_date - start_date).days,
