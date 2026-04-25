@@ -409,7 +409,7 @@ export default function BacktestUI({ get, post }) {
     end_date: '2023-12-29',
     walk_forward: false,
   })
-  const [symbols, setSymbols] = useState('SPY,QQQ,AAPL')
+  const [symbols, setSymbols] = useState('SPY,QQQ,AAPL,NVDA,MSFT')
   const [strategies, setStrategies] = useState({ momentum: true, iv_rank: true, flow: true })
   const [jobId, setJobId] = useState(null)
   const [jobStatus, setJobStatus] = useState(null)

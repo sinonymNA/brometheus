@@ -45,10 +45,10 @@ class MomentumStrategy(BaseStrategy):
 
     SYMBOLS = ["SPY", "QQQ", "AAPL", "NVDA", "TSLA", "MSFT", "AMD", "META"]
 
-    RSI_BULL_THRESHOLD = 62    # RSI must be above this for a bullish signal
-    RSI_BEAR_THRESHOLD = 38    # RSI must be below this for a bearish signal
-    VOLUME_RATIO_MIN = 1.5     # current bar volume / 20-bar avg
-    IV_RANK_MAX = 60           # avoid expensive options when IV is already high
+    RSI_BULL_THRESHOLD = 57    # RSI must be above this for a bullish signal
+    RSI_BEAR_THRESHOLD = 43    # RSI must be below this for a bearish signal
+    VOLUME_RATIO_MIN = 1.15    # current bar volume / 20-bar avg
+    IV_RANK_MAX = 65           # avoid expensive options when IV is already high
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

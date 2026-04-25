@@ -30,18 +30,18 @@ class BacktestParams:
 
     All values are per-run only — they never touch live-bot constants.
     """
-    rsi_bull_threshold: float = 62.0    # RSI above this → bull momentum trigger
-    rsi_bear_threshold: float = 38.0    # RSI below this → bear momentum trigger
-    volume_ratio_min: float = 1.5       # call/put volume ratio min for flow strategy
-    iv_rank_max: float = 60.0           # momentum: skip when IV rank % exceeds this (longs get vol-crushed)
-    iv_rank_min: float = 70.0           # iv_rank strategy: trigger above this %
-    signal_strength_min: float = 0.25   # discard signals below this
-    stop_loss_pct: float = 0.40         # long: exit when premium loses this fraction (40 %)
-    profit_target_pct: float = 1.00     # long: exit when gain reaches this fraction (100 % = double)
+    rsi_bull_threshold: float = 57.0    # RSI above this → bull momentum trigger
+    rsi_bear_threshold: float = 43.0    # RSI below this → bear momentum trigger
+    volume_ratio_min: float = 1.15      # call/put volume ratio min for flow strategy
+    iv_rank_max: float = 65.0           # momentum: skip when IV rank % exceeds this (longs get vol-crushed)
+    iv_rank_min: float = 55.0           # iv_rank strategy: trigger above this %
+    signal_strength_min: float = 0.10   # discard signals below this
+    stop_loss_pct: float = 0.35         # long: exit when premium loses this fraction (35 %)
+    profit_target_pct: float = 0.65     # long: exit when gain reaches this fraction (65 %) — ~1.85:1 R:R
     min_dte: int = 5                    # close position when DTE ≤ this
     max_dte: int = 45                   # only enter options with ≤ this DTE
-    max_positions: int = 5              # max concurrent open positions
-    position_size_pct: float = 0.02     # max portfolio fraction risked per trade
+    max_positions: int = 8              # max concurrent open positions
+    position_size_pct: float = 0.025    # max portfolio fraction risked per trade
 
     @classmethod
     def from_dict(cls, d: dict) -> "BacktestParams":
@@ -258,8 +258,8 @@ def _eval_momentum(
     if rsi is None:
         return None
 
-    # Skip when market is in stress — false breakouts dominate above VIX 28
-    if current_vix is not None and current_vix > 28.0:
+    # Skip when market is in extreme stress — above VIX 35 directional signals become unreliable
+    if current_vix is not None and current_vix > 35.0:
         return None
 
     if iv_rank is not None and iv_rank > params.iv_rank_max:
