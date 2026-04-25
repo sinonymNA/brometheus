@@ -240,13 +240,16 @@ def _eval_momentum(
     spy_spot: float | None = None,
     spy_ma20: float | None = None,
     iv_rank: float | None = None,
+    volumes: list[float] | None = None,
+    current_vix: float | None = None,
 ) -> list[dict] | None:
-    """Buy calls/puts on RSI + price breakout momentum, with SPY 20d MA trend filter.
+    """Buy calls/puts on RSI + volume-confirmed price breakout momentum.
 
-    Bull: RSI > threshold AND spot > 10-day high → buy call.
-    Bear: RSI < threshold AND spot < 10-day low  → buy put.
-    Trend filter blocks calls in bear regime and puts in bull regime.
+    Bull: RSI > threshold AND spot > 10-day high AND volume > 20-day avg → buy call.
+    Bear: RSI < threshold AND spot < 10-day low  AND volume > 20-day avg → buy put.
+    Trend filter (SPY 20d MA) blocks calls in bear regime and puts in bull regime.
     Skips when IV rank exceeds params.iv_rank_max (vol crush risk on longs).
+    Skips when VIX > 28 (high-stress, choppy markets produce false breakouts).
     """
     if len(closes) < 25:
         return None
@@ -255,8 +258,19 @@ def _eval_momentum(
     if rsi is None:
         return None
 
+    # Skip when market is in stress — false breakouts dominate above VIX 28
+    if current_vix is not None and current_vix > 28.0:
+        return None
+
     if iv_rank is not None and iv_rank > params.iv_rank_max:
         return None
+
+    # Volume confirmation: require above-average volume on the breakout day.
+    # This is the most reliable filter for separating genuine from false breakouts.
+    if volumes and len(volumes) >= 21:
+        avg_vol = sum(volumes[-21:-1]) / 20.0
+        if avg_vol > 0 and volumes[-1] < avg_vol * params.volume_ratio_min:
+            return None   # low-volume breakout — skip
 
     # Price breakout: compare today vs 10-bar high/low before today
     window = closes[-11:-1]
@@ -283,9 +297,9 @@ def _eval_momentum(
     if not (bull or bear):
         return None
 
-    # 30 DTE gives trades room to develop; 21 DTE options lost too much
-    # to theta before the momentum move fully played out.
-    target_dte = min(30, params.max_dte)
+    # 21 DTE provides enough gamma to capture the momentum move without
+    # excessive theta drag; shorter-dated options outperform on momentum signals.
+    target_dte = min(21, params.max_dte)
     expiry = _next_expiry(today, target_dte)
     dte = (expiry - today).days
 
@@ -535,10 +549,12 @@ class BacktestEngine:
         signals_generated = 0
         signals_acted_on = 0
 
-        # Build per-symbol close-price arrays keyed by date
+        # Build per-symbol close-price and volume arrays keyed by date
         closes_by_symbol: dict[str, dict[date, float]] = {}
+        volumes_by_symbol: dict[str, dict[date, float]] = {}
         for sym, bars in bars_map.items():
-            closes_by_symbol[sym] = {b.timestamp.date(): b.close for b in bars}
+            closes_by_symbol[sym]  = {b.timestamp.date(): b.close for b in bars}
+            volumes_by_symbol[sym] = {b.timestamp.date(): float(getattr(b, "volume", 0) or 0) for b in bars}
 
         # SPY close list ordered by trading_days for rolling MA computation
         spy_close_list: list[float] = []
@@ -565,12 +581,12 @@ class BacktestEngine:
 
             sigma = max(current_vix / 100.0, 0.05)
 
-            # SPY regime: update rolling close list and compute 50d MA (matches live code).
-            # 50d is smoother than 20d — avoids whipsaws during choppy periods.
+            # SPY regime: 20d MA — responsive enough to flip during genuine trend changes
+            # without lagging so far that the filter is useless in short backtests.
             spy_today = closes_by_symbol.get("SPY", {}).get(today)
             if spy_today:
                 spy_close_list.append(spy_today)
-            spy_ma20 = _compute_sma(spy_close_list, 50)
+            spy_ma20 = _compute_sma(spy_close_list, 20)
 
             # IV rank for today (0–100 scale, passed to momentum filter)
             if len(vix_history_window) >= 10:
@@ -621,12 +637,21 @@ class BacktestEngine:
                         chain = self._loader.reconstruct_options_chain(sym, spot, current_vix,
                                                                         datetime.combine(today, datetime.min.time()))
 
+                    # Rolling volume array for this symbol up to today
+                    sym_volumes = [
+                        volumes_by_symbol[sym][d]
+                        for d in trading_days[:day_idx + 1]
+                        if d in volumes_by_symbol.get(sym, {})
+                    ]
+
                     candidates: list[dict] = []
                     if "momentum" in self._strategies:
                         sigs = _eval_momentum(
                             sym, sym_closes, spot, sigma, balance, today, params,
                             spy_spot=spy_today, spy_ma20=spy_ma20,
                             iv_rank=iv_rank_today,
+                            volumes=sym_volumes,
+                            current_vix=current_vix,
                         )
                         if sigs:
                             candidates.extend(sigs)
