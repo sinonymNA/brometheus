@@ -30,18 +30,19 @@ class BacktestParams:
 
     All values are per-run only — they never touch live-bot constants.
     """
-    rsi_bull_threshold: float = 55.0    # RSI above this → bull momentum trigger
-    rsi_bear_threshold: float = 45.0    # RSI below this → bear momentum trigger
-    volume_ratio_min: float = 1.0       # call/put volume ratio min for flow strategy
-    iv_rank_max: float = 70.0           # momentum: skip when IV rank % exceeds this (longs get vol-crushed)
-    iv_rank_min: float = 40.0           # iv_rank strategy: trigger above this %
-    signal_strength_min: float = 0.05   # discard signals below this
-    stop_loss_pct: float = 0.30         # long: exit when premium loses this fraction (30 %)
-    profit_target_pct: float = 0.50     # long: exit when gain reaches this fraction (50 %) — ~1.67:1 R:R, fast turnover
-    min_dte: int = 3                    # close position when DTE ≤ this (more aggressive expiry closing)
-    max_dte: int = 21                   # only enter options with ≤ this DTE (shorter-dated, more gamma)
-    max_positions: int = 12             # max concurrent open positions
-    position_size_pct: float = 0.045    # max portfolio fraction risked per trade (very aggressive)
+    rsi_bull_threshold: float = 57.0    # RSI above this → bull momentum trigger
+    rsi_bear_threshold: float = 43.0    # RSI below this → bear momentum trigger
+    volume_ratio_min: float = 1.2       # call/put volume ratio min for flow strategy
+    iv_rank_max: float = 65.0           # momentum: skip when IV rank % exceeds this
+    iv_rank_min: float = 55.0           # iv_rank strategy: trigger above this %
+    signal_strength_min: float = 0.20   # discard signals below this
+    stop_loss_pct: float = 0.35         # long: exit when premium loses this fraction (35 %)
+    profit_target_pct: float = 0.75     # long: exit when gain reaches this fraction — 2.14:1 R:R
+    min_dte: int = 5                    # close position when DTE ≤ this
+    max_dte: int = 30                   # only enter options with ≤ this DTE
+    max_positions: int = 6              # Apex-safe: limits concurrent exposure
+    position_size_pct: float = 0.02     # 2% per trade → max drawdown ~$2k at 2 simultaneous stops
+    apex_daily_loss_limit: float = 0.04 # halt new trades if daily loss exceeds 4% of starting balance
 
     @classmethod
     def from_dict(cls, d: dict) -> "BacktestParams":
@@ -259,8 +260,8 @@ def _eval_momentum(
     if rsi is None:
         return None
 
-    # Skip only in panic conditions (VIX > 40) — trade in all other conditions
-    if current_vix is not None and current_vix > 40.0:
+    # Skip when VIX > 35 — false breakouts dominate in panic conditions
+    if current_vix is not None and current_vix > 35.0:
         return None
 
     if iv_rank is not None and iv_rank > params.iv_rank_max:
@@ -523,36 +524,40 @@ def _eval_bollinger_bands(
     upper_band = sma20 + (2 * std_dev)
     lower_band = sma20 - (2 * std_dev)
 
-    # Signal when price touches bands (mean reversion setup)
-    target_dte = min(7, params.max_dte)
+    # Only fire on decisive breaks BELOW lower band or ABOVE upper band (not just touches)
+    target_dte = min(14, params.max_dte)
     expiry = _next_expiry(today, target_dte)
     dte = (expiry - today).days
 
     signals = []
 
-    # Lower band touch: price near lower band → expect bounce up → buy call
-    if spot <= lower_band * 1.02 and spot > lower_band * 0.98:
-        strike = round(spot * 1.00, 0)
-        price = _option_price(spot, strike, dte, sigma, "call")
-        if price >= 0.10:
-            strength = min((sma20 - spot) / (sma20 * 0.10), 1.0)  # Strength from distance to MA
-            signals.append({
-                "symbol": symbol, "strategy": "bb", "signal_type": "bb_lower_touch",
-                "action": "buy", "option_type": "call", "strike": strike,
-                "expiry": expiry, "price": price, "strength": round(max(0.15, strength), 4),
-            })
+    # Price closes BELOW lower band → strong oversold → buy call for bounce
+    if spot < lower_band:
+        pct_below = (lower_band - spot) / lower_band
+        if pct_below >= 0.003:  # Must be at least 0.3% below band (meaningful break)
+            strike = round(spot * 1.00, 0)
+            price = _option_price(spot, strike, dte, sigma, "call")
+            if price >= 0.10:
+                strength = min(pct_below / 0.02, 1.0)
+                signals.append({
+                    "symbol": symbol, "strategy": "bb", "signal_type": "bb_lower_break",
+                    "action": "buy", "option_type": "call", "strike": strike,
+                    "expiry": expiry, "price": price, "strength": round(max(0.25, strength), 4),
+                })
 
-    # Upper band touch: price near upper band → expect pullback down → buy put
-    if spot >= upper_band * 0.98 and spot < upper_band * 1.02:
-        strike = round(spot * 1.00, 0)
-        price = _option_price(spot, strike, dte, sigma, "put")
-        if price >= 0.10:
-            strength = min((spot - sma20) / (sma20 * 0.10), 1.0)
-            signals.append({
-                "symbol": symbol, "strategy": "bb", "signal_type": "bb_upper_touch",
-                "action": "buy", "option_type": "put", "strike": strike,
-                "expiry": expiry, "price": price, "strength": round(max(0.15, strength), 4),
-            })
+    # Price closes ABOVE upper band → strong overbought → buy put for pullback
+    if spot > upper_band:
+        pct_above = (spot - upper_band) / upper_band
+        if pct_above >= 0.003:
+            strike = round(spot * 1.00, 0)
+            price = _option_price(spot, strike, dte, sigma, "put")
+            if price >= 0.10:
+                strength = min(pct_above / 0.02, 1.0)
+                signals.append({
+                    "symbol": symbol, "strategy": "bb", "signal_type": "bb_upper_break",
+                    "action": "buy", "option_type": "put", "strike": strike,
+                    "expiry": expiry, "price": price, "strength": round(max(0.25, strength), 4),
+                })
 
     return signals if signals else None
 
@@ -666,6 +671,7 @@ class BacktestEngine:
 
         # ── Simulation state ─────────────────────────────────────────────────
         balance = STARTING_BALANCE
+        peak_balance = STARTING_BALANCE           # for trailing drawdown guard
         open_trades: list[_BacktestTrade] = []
         closed_trades: list[_BacktestTrade] = []
         equity_curve: list[float] = [balance]
@@ -741,8 +747,18 @@ class BacktestEngine:
                     still_open.append(trade)
             open_trades = still_open
 
+            # ── Update peak balance for trailing drawdown tracking ───────────
+            if balance > peak_balance:
+                peak_balance = balance
+
+            # ── Apex-style circuit breakers: halt new entries if limits hit ──
+            daily_loss = day_open_pnl  # realised PnL for today so far
+            trailing_dd = (peak_balance - balance) / STARTING_BALANCE
+            apex_daily_limit_hit = daily_loss < -(STARTING_BALANCE * params.apex_daily_loss_limit)
+            apex_drawdown_hit = trailing_dd > 0.05  # 5% trailing drawdown = Apex account fail
+
             # ── Signal generation + entry ────────────────────────────────────
-            if len(open_trades) < params.max_positions:
+            if len(open_trades) < params.max_positions and not apex_daily_limit_hit and not apex_drawdown_hit:
                 for sym in self._symbols:
                     spot = closes_by_symbol.get(sym, {}).get(today, 0.0)
                     if spot <= 0:
