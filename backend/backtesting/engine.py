@@ -283,7 +283,9 @@ def _eval_momentum(
     if not (bull or bear):
         return None
 
-    target_dte = min(21, params.max_dte)
+    # 30 DTE gives trades room to develop; 21 DTE options lost too much
+    # to theta before the momentum move fully played out.
+    target_dte = min(30, params.max_dte)
     expiry = _next_expiry(today, target_dte)
     dte = (expiry - today).days
 
@@ -563,11 +565,12 @@ class BacktestEngine:
 
             sigma = max(current_vix / 100.0, 0.05)
 
-            # SPY regime: update rolling close list and compute 20d MA
+            # SPY regime: update rolling close list and compute 50d MA (matches live code).
+            # 50d is smoother than 20d — avoids whipsaws during choppy periods.
             spy_today = closes_by_symbol.get("SPY", {}).get(today)
             if spy_today:
                 spy_close_list.append(spy_today)
-            spy_ma20 = _compute_sma(spy_close_list, 20)
+            spy_ma20 = _compute_sma(spy_close_list, 50)
 
             # IV rank for today (0–100 scale, passed to momentum filter)
             if len(vix_history_window) >= 10:
