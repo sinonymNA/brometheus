@@ -43,6 +43,11 @@ class BacktestParams:
     max_positions: int = 6              # Apex-safe: limits concurrent exposure
     position_size_pct: float = 0.015    # 1.5%: max loss ~$280/trade, 8 losses = $2,240 (under $2,500 Apex limit)
     apex_daily_loss_limit: float = 0.04 # pause entries today if daily loss exceeds 4%
+    # ── Regime + AI scoring filters (new) ─────────────────────────────────────
+    use_regime_filter: bool = True      # block counter-trend signals across ALL strategies
+    vix_position_scale: bool = True     # shrink size when VIX > 20, grow when VIX < 15
+    strategy_cooldown_losses: int = 2   # pause a strategy for 5 days after this many consecutive losses
+    ai_min_score: float = 0.60         # simulated AI quality gate: skip signals scoring below this
 
     @classmethod
     def from_dict(cls, d: dict) -> "BacktestParams":
@@ -226,6 +231,92 @@ def _trade_pnl(trade: _BacktestTrade, exit_price: float) -> float:
         return (trade.entry_price - exit_price) * multiplier
     else:
         return (exit_price - trade.entry_price) * multiplier
+
+
+# ── Regime / AI helpers ──────────────────────────────────────────────────────
+
+
+def _spy_regime(spy_closes: list[float]) -> str:
+    """Return 'bull', 'bear', or 'neutral' based on SPY SMA20 slope."""
+    if len(spy_closes) < 22:
+        return "neutral"
+    sma_today = _compute_sma(spy_closes, 20)
+    sma_prev  = _compute_sma(spy_closes[:-1], 20)
+    if sma_today is None or sma_prev is None:
+        return "neutral"
+    if sma_today > sma_prev * 1.0005:   # rising MA → bull
+        return "bull"
+    if sma_today < sma_prev * 0.9995:   # falling MA → bear
+        return "bear"
+    return "neutral"
+
+
+def _vix_size_multiplier(vix: float) -> float:
+    """Scale position size by VIX: smaller in high-vol, larger in calm markets."""
+    if vix >= 28:
+        return 0.50   # half size — market too choppy
+    if vix >= 22:
+        return 0.75
+    if vix <= 13:
+        return 1.25   # calm market — lean in slightly
+    return 1.00
+
+
+def _ai_signal_score(
+    direction: str,
+    regime: str,
+    rsi: float | None,
+    vix: float,
+    iv_rank: float | None,
+    strength: float,
+    recent_win_rate: float,
+) -> float:
+    """Heuristic AI signal quality score (0–1).
+
+    In live trading this is replaced by a real Claude API call in
+    ClaudeAnalyzer.score_signal(). In backtesting we approximate the
+    same reasoning with deterministic logic so results are reproducible.
+
+    Factors:
+    - Direction alignment with regime (+/- big weight)
+    - VIX environment (low = better for longs, high = better for shorts)
+    - Signal strength
+    - Recent system win rate (avoid trading in losing streaks)
+    """
+    score = 0.5  # base
+
+    # Regime alignment is the biggest factor
+    if regime == "bull" and direction in ("call", "bull"):
+        score += 0.25
+    elif regime == "bear" and direction in ("put", "bear"):
+        score += 0.25
+    elif regime != "neutral":
+        score -= 0.20   # counter-trend: heavy penalty
+
+    # VIX environment for longs
+    if direction in ("call", "bull"):
+        if vix < 18:
+            score += 0.10
+        elif vix > 25:
+            score -= 0.15
+
+    # RSI confirmation for directional trades
+    if rsi is not None:
+        if direction in ("call", "bull") and rsi > 50:
+            score += 0.05
+        elif direction in ("put", "bear") and rsi < 50:
+            score += 0.05
+
+    # Signal strength
+    score += strength * 0.15
+
+    # Penalise if system has been losing recently
+    if recent_win_rate < 0.45:
+        score -= 0.10
+    elif recent_win_rate > 0.65:
+        score += 0.05
+
+    return round(max(0.0, min(score, 1.0)), 3)
 
 
 # ── Strategy evaluators ───────────────────────────────────────────────────────
@@ -671,13 +762,17 @@ class BacktestEngine:
 
         # ── Simulation state ─────────────────────────────────────────────────
         balance = STARTING_BALANCE
-        peak_balance = STARTING_BALANCE           # for trailing drawdown guard
+        peak_balance = STARTING_BALANCE
         open_trades: list[_BacktestTrade] = []
         closed_trades: list[_BacktestTrade] = []
         equity_curve: list[float] = [balance]
         daily_pnl_list: list[float] = []
         signals_generated = 0
         signals_acted_on = 0
+        # strategy cooldown tracking: strategy → day_idx when it can trade again
+        strategy_cooldown_until: dict[str, int] = {}
+        # consecutive loss counter per strategy
+        strategy_consec_losses: dict[str, int] = {s: 0 for s in self._strategies}
 
         # Build per-symbol close-price and volume arrays keyed by date
         closes_by_symbol: dict[str, dict[date, float]] = {}
@@ -743,6 +838,14 @@ class BacktestEngine:
                     balance += pnl
                     day_open_pnl += pnl
                     closed_trades.append(trade)
+                    # Update strategy consecutive loss counter
+                    strat = trade.strategy
+                    if pnl < 0:
+                        strategy_consec_losses[strat] = strategy_consec_losses.get(strat, 0) + 1
+                        if strategy_consec_losses[strat] >= params.strategy_cooldown_losses:
+                            strategy_cooldown_until[strat] = day_idx + 5  # 5-day cooldown
+                    else:
+                        strategy_consec_losses[strat] = 0  # reset on win
                 else:
                     still_open.append(trade)
             open_trades = still_open
@@ -759,6 +862,12 @@ class BacktestEngine:
             trailing_dd = (peak_balance - balance) / STARTING_BALANCE
             apex_daily_limit_hit = daily_loss < -(STARTING_BALANCE * params.apex_daily_loss_limit)
             apex_drawdown_warning = trailing_dd > 0.045  # slow down at 4.5%, don't fully stop
+
+            # ── Compute today's regime + recent win rate for AI scorer ──────────
+            regime = _spy_regime(spy_close_list) if params.use_regime_filter else "neutral"
+            vix_mult = _vix_size_multiplier(current_vix) if params.vix_position_scale else 1.0
+            recent = [t for t in closed_trades[-20:] if t.pnl is not None]
+            recent_wr = (sum(1 for t in recent if (t.pnl or 0) > 0) / len(recent)) if recent else 0.55
 
             # ── Signal generation + entry ────────────────────────────────────
             if len(open_trades) < params.max_positions and not apex_daily_limit_hit and not apex_drawdown_warning:
@@ -817,8 +926,35 @@ class BacktestEngine:
 
                     signals_generated += len(candidates)
 
-                    # Quality filter: discard low-conviction signals
+                    # ── Quality filter 1: signal strength ────────────────────
                     candidates = [s for s in candidates if s.get("strength", 0) > params.signal_strength_min]
+
+                    # ── Quality filter 2: strategy cooldown ──────────────────
+                    candidates = [
+                        s for s in candidates
+                        if day_idx >= strategy_cooldown_until.get(s["strategy"], 0)
+                    ]
+
+                    # ── Quality filter 3: AI signal scorer ───────────────────
+                    # Score each signal; only trade above params.ai_min_score.
+                    # Direction for condors is neutral; for directional use option_type.
+                    scored = []
+                    rsi_today = _compute_rsi(sym_closes) if len(sym_closes) >= 15 else None
+                    for s in candidates:
+                        direction = s.get("option_type", "call")
+                        ai_score = _ai_signal_score(
+                            direction=direction,
+                            regime=regime,
+                            rsi=rsi_today,
+                            vix=current_vix,
+                            iv_rank=iv_rank_today,
+                            strength=s.get("strength", 0.2),
+                            recent_win_rate=recent_wr,
+                        )
+                        if ai_score >= params.ai_min_score or direction == "condor":
+                            s["ai_score"] = ai_score
+                            scored.append(s)
+                    candidates = scored
 
                     for sig in candidates:
                         if len(open_trades) >= params.max_positions:
@@ -828,6 +964,13 @@ class BacktestEngine:
                         if (sig["symbol"], sig["strategy"]) in existing:
                             continue
 
+                        # VIX-scaled position size: shrink in high-vol, grow in calm
+                        scaled_size = params.position_size_pct * vix_mult
+                        # Boost size slightly when AI score is high-confidence
+                        ai_score = sig.get("ai_score", 0.6)
+                        if ai_score >= 0.80:
+                            scaled_size = min(scaled_size * 1.20, params.position_size_pct * 1.5)
+
                         qty = _kelly_contracts(
                             balance,
                             win_rate=0.55,
@@ -835,7 +978,9 @@ class BacktestEngine:
                             avg_loss=250.0,
                             strength=sig["strength"],
                             option_price=sig["price"],
-                            params=params,
+                            params=BacktestParams(
+                                **{**params.to_dict(), "position_size_pct": scaled_size}
+                            ),
                             recent_trades=closed_trades,
                         )
                         # Simulate bid-ask spread: buys fill at ask (~1 % above mid),
@@ -844,8 +989,8 @@ class BacktestEngine:
                         entry_price = raw_price * (1.01 if sig["action"] == "buy" else 0.99)
 
                         cost = entry_price * 100 * qty
-                        if sig["action"] == "buy" and cost > balance * params.position_size_pct * 2:
-                            qty = max(1, int(balance * params.position_size_pct / (entry_price * 100)))
+                        if sig["action"] == "buy" and cost > balance * scaled_size * 2:
+                            qty = max(1, int(balance * scaled_size / (entry_price * 100)))
 
                         trade = _BacktestTrade(
                             id=uuid.uuid4().hex,
