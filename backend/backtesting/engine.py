@@ -36,13 +36,13 @@ class BacktestParams:
     iv_rank_max: float = 65.0           # momentum: skip when IV rank % exceeds this
     iv_rank_min: float = 55.0           # iv_rank strategy: trigger above this %
     signal_strength_min: float = 0.20   # discard signals below this
-    stop_loss_pct: float = 0.35         # long: exit when premium loses this fraction (35 %)
-    profit_target_pct: float = 0.75     # long: exit when gain reaches this fraction — 2.14:1 R:R
+    stop_loss_pct: float = 0.25         # long: exit at 25% loss — keeps avg loss < avg win
+    profit_target_pct: float = 0.75     # long: exit at 75% gain — 3:1 R:R vs stop
     min_dte: int = 5                    # close position when DTE ≤ this
     max_dte: int = 30                   # only enter options with ≤ this DTE
     max_positions: int = 6              # Apex-safe: limits concurrent exposure
-    position_size_pct: float = 0.02     # 2% per trade → max drawdown ~$2k at 2 simultaneous stops
-    apex_daily_loss_limit: float = 0.04 # halt new trades if daily loss exceeds 4% of starting balance
+    position_size_pct: float = 0.015    # 1.5%: max loss ~$280/trade, 8 losses = $2,240 (under $2,500 Apex limit)
+    apex_daily_loss_limit: float = 0.04 # pause entries today if daily loss exceeds 4%
 
     @classmethod
     def from_dict(cls, d: dict) -> "BacktestParams":
@@ -751,14 +751,17 @@ class BacktestEngine:
             if balance > peak_balance:
                 peak_balance = balance
 
-            # ── Apex-style circuit breakers: halt new entries if limits hit ──
-            daily_loss = day_open_pnl  # realised PnL for today so far
+            # ── Apex-style circuit breakers (daily reset — not permanent) ─────
+            # Daily loss limit: skip new entries today if we've already lost too much today.
+            # Trailing drawdown: skip today if drawdown from peak exceeds 4.5% (warning zone).
+            # Both reset tomorrow so we can keep trading after a bad day.
+            daily_loss = day_open_pnl
             trailing_dd = (peak_balance - balance) / STARTING_BALANCE
             apex_daily_limit_hit = daily_loss < -(STARTING_BALANCE * params.apex_daily_loss_limit)
-            apex_drawdown_hit = trailing_dd > 0.05  # 5% trailing drawdown = Apex account fail
+            apex_drawdown_warning = trailing_dd > 0.045  # slow down at 4.5%, don't fully stop
 
             # ── Signal generation + entry ────────────────────────────────────
-            if len(open_trades) < params.max_positions and not apex_daily_limit_hit and not apex_drawdown_hit:
+            if len(open_trades) < params.max_positions and not apex_daily_limit_hit and not apex_drawdown_warning:
                 for sym in self._symbols:
                     spot = closes_by_symbol.get(sym, {}).get(today, 0.0)
                     if spot <= 0:
