@@ -41,7 +41,7 @@ class BacktestParams:
     min_dte: int = 3                    # close position when DTE ≤ this (more aggressive expiry closing)
     max_dte: int = 21                   # only enter options with ≤ this DTE (shorter-dated, more gamma)
     max_positions: int = 12             # max concurrent open positions
-    position_size_pct: float = 0.035    # max portfolio fraction risked per trade (aggressive sizing)
+    position_size_pct: float = 0.045    # max portfolio fraction risked per trade (very aggressive)
 
     @classmethod
     def from_dict(cls, d: dict) -> "BacktestParams":
@@ -497,6 +497,66 @@ def _eval_ma_crossover(
     return None
 
 
+def _eval_bollinger_bands(
+    symbol: str,
+    closes: list[float],
+    spot: float,
+    sigma: float,
+    balance: float,
+    today: date,
+    params: BacktestParams,
+) -> list[dict] | None:
+    """Mean reversion on Bollinger Band touches: buy when price hits bands."""
+    if len(closes) < 21:
+        return None
+
+    sma20 = _compute_sma(closes, 20)
+    if sma20 is None:
+        return None
+
+    # Calculate standard deviation
+    closes_20 = closes[-20:]
+    mean = sum(closes_20) / len(closes_20)
+    variance = sum((x - mean) ** 2 for x in closes_20) / len(closes_20)
+    std_dev = variance ** 0.5
+
+    upper_band = sma20 + (2 * std_dev)
+    lower_band = sma20 - (2 * std_dev)
+
+    # Signal when price touches bands (mean reversion setup)
+    target_dte = min(7, params.max_dte)
+    expiry = _next_expiry(today, target_dte)
+    dte = (expiry - today).days
+
+    signals = []
+
+    # Lower band touch: price near lower band → expect bounce up → buy call
+    if spot <= lower_band * 1.02 and spot > lower_band * 0.98:
+        strike = round(spot * 1.00, 0)
+        price = _option_price(spot, strike, dte, sigma, "call")
+        if price >= 0.10:
+            strength = min((sma20 - spot) / (sma20 * 0.10), 1.0)  # Strength from distance to MA
+            signals.append({
+                "symbol": symbol, "strategy": "bb", "signal_type": "bb_lower_touch",
+                "action": "buy", "option_type": "call", "strike": strike,
+                "expiry": expiry, "price": price, "strength": round(max(0.15, strength), 4),
+            })
+
+    # Upper band touch: price near upper band → expect pullback down → buy put
+    if spot >= upper_band * 0.98 and spot < upper_band * 1.02:
+        strike = round(spot * 1.00, 0)
+        price = _option_price(spot, strike, dte, sigma, "put")
+        if price >= 0.10:
+            strength = min((spot - sma20) / (sma20 * 0.10), 1.0)
+            signals.append({
+                "symbol": symbol, "strategy": "bb", "signal_type": "bb_upper_touch",
+                "action": "buy", "option_type": "put", "strike": strike,
+                "expiry": expiry, "price": price, "strength": round(max(0.15, strength), 4),
+            })
+
+    return signals if signals else None
+
+
 def _check_exit(
     trade: _BacktestTrade,
     spot: float,
@@ -568,7 +628,7 @@ class BacktestEngine:
     ) -> None:
         self._loader = loader
         self._symbols = symbols
-        self._strategies = strategies or ["momentum", "iv_rank", "flow", "ma_cross"]
+        self._strategies = strategies or ["momentum", "iv_rank", "flow", "ma_cross", "bb"]
 
     async def run(
         self,
@@ -729,6 +789,10 @@ class BacktestEngine:
                             candidates.extend(sigs)
                     if "ma_cross" in self._strategies:
                         sigs = _eval_ma_crossover(sym, sym_closes, spot, sigma, balance, today, params)
+                        if sigs:
+                            candidates.extend(sigs)
+                    if "bb" in self._strategies:
+                        sigs = _eval_bollinger_bands(sym, sym_closes, spot, sigma, balance, today, params)
                         if sigs:
                             candidates.extend(sigs)
 
