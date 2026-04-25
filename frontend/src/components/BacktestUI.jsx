@@ -280,6 +280,40 @@ function StrategyBreakdown({ tradesByStrategy, pnlByStrategy }) {
   )
 }
 
+function MonthlyPnLTable({ monthlyPnl }) {
+  if (!monthlyPnl || Object.keys(monthlyPnl).length === 0) {
+    return <div className="px-3 py-2 text-xs muted">No monthly data</div>
+  }
+
+  const months = Object.entries(monthlyPnl).sort(([a], [b]) => a.localeCompare(b))
+  const totalMonths = months.length
+  const avgMonthly = months.reduce((sum, [, pnl]) => sum + pnl, 0) / totalMonths
+
+  return (
+    <div className="px-3 py-2">
+      <div className="text-xs muted uppercase tracking-widest mb-2">Monthly P&L</div>
+      <table className="w-full text-xs mb-3">
+        <tbody>
+          {months.map(([month, pnl]) => (
+            <tr key={month} className="border-b border-border last:border-0">
+              <td className="px-2 py-1 muted">{month}</td>
+              <td className="px-2 py-1 font-mono text-right" style={{ color: pnl >= 0 ? '#00FF88' : '#FF0055' }}>
+                {pnl >= 0 ? '+' : ''}{formatMoney(pnl)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="flex justify-between text-xs border-t border-border pt-1">
+        <span className="muted">Avg/Month</span>
+        <span className="font-mono" style={{ color: avgMonthly >= 0 ? '#00FF88' : '#FF0055' }}>
+          {avgMonthly >= 0 ? '+' : ''}{formatMoney(avgMonthly)}
+        </span>
+      </div>
+    </div>
+  )
+}
+
 // ── Win/Loss pie ──────────────────────────────────────────────────────────────
 
 function WinLossPie({ wins, losses }) {
@@ -575,6 +609,10 @@ export default function BacktestUI({ get, post }) {
               />
             </Card>
           </div>
+
+          <Card title="Monthly P&L Analysis">
+            <MonthlyPnLTable monthlyPnl={result.monthly_pnl} />
+          </Card>
 
           <Card title="Daily PnL Log">
             <TradeTable {...result} />

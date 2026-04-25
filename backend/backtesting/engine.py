@@ -95,6 +95,7 @@ class BacktestResult:
     pnl_by_strategy: dict[str, float]
     equity_curve: list[float]
     daily_pnl_history: list[float]
+    monthly_pnl: dict[str, float]
     best_trade: dict
     worst_trade: dict
     best_day: dict
@@ -744,6 +745,15 @@ class BacktestEngine:
         total_pnl = sum(pnls)
         total_return_pct = total_pnl / STARTING_BALANCE
 
+        # Calculate monthly PnL by grouping trades by exit month
+        monthly_pnl: dict[str, float] = {}
+        for trade in closed_trades:
+            if trade.exit_time is not None and trade.pnl is not None:
+                month_key = trade.exit_time.strftime("%Y-%m")
+                monthly_pnl[month_key] = monthly_pnl.get(month_key, 0.0) + trade.pnl
+        # Sort by month
+        monthly_pnl = dict(sorted(monthly_pnl.items()))
+
         trades_by_strategy: dict[str, int] = {}
         pnl_by_strategy: dict[str, float] = {}
         for t in closed_trades:
@@ -797,6 +807,7 @@ class BacktestEngine:
             pnl_by_strategy=pnl_by_strategy,
             equity_curve=equity_curve,
             daily_pnl_history=daily_pnl_list,
+            monthly_pnl=monthly_pnl,
             best_trade=_trade_dict(best),
             worst_trade=_trade_dict(worst),
             best_day={"date": best_day_key, "pnl": daily_pnl_by_date.get(best_day_key, 0.0)} if best_day_key else {},
