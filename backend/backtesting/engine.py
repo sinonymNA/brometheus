@@ -284,11 +284,11 @@ def _spy_regime(spy_closes: list[float]) -> str:
 def _vix_size_multiplier(vix: float) -> float:
     """Scale position size by VIX: smaller in high-vol, larger in calm markets."""
     if vix >= 28:
-        return 0.50   # half size — market too choppy
+        return 0.50
     if vix >= 22:
         return 0.75
     if vix <= 13:
-        return 1.25   # calm market — lean in slightly
+        return 1.25
     return 1.00
 
 
@@ -946,12 +946,12 @@ class BacktestEngine:
 
             sigma = max(current_vix / 100.0, 0.05)
 
-            # SPY regime: 20d MA — responsive enough to flip during genuine trend changes
-            # without lagging so far that the filter is useless in short backtests.
+            # SPY regime: 20d MA slope for daily regime; 50d MA position for credit spreads
             spy_today = closes_by_symbol.get("SPY", {}).get(today)
             if spy_today:
                 spy_close_list.append(spy_today)
             spy_ma20 = _compute_sma(spy_close_list, 20)
+            spy_ma50 = _compute_sma(spy_close_list, 50)
 
             # IV rank for today (0–100 scale, passed to momentum filter)
             if len(vix_history_window) >= 10:
@@ -1067,11 +1067,14 @@ class BacktestEngine:
                         sigs = _eval_iv_rank(sym, spot, current_vix, vix_history_window, balance, today, params)
                         if sigs:
                             candidates.extend(sigs)
-                    if "bull_put" in self._strategies and regime == "bull":
+                    # Credit spreads: use 50d MA position (stable) not 20d slope (noisy)
+                    spy_above_50d = spy_ma50 is not None and spy_today is not None and spy_today > spy_ma50
+                    spy_below_50d = spy_ma50 is not None and spy_today is not None and spy_today < spy_ma50
+                    if "bull_put" in self._strategies and spy_above_50d:
                         sigs = _eval_bull_put_spread(sym, spot, current_vix, vix_history_window, balance, today, params)
                         if sigs:
                             candidates.extend(sigs)
-                    if "bear_call" in self._strategies and regime == "bear":
+                    if "bear_call" in self._strategies and spy_below_50d:
                         sigs = _eval_bear_call_spread(sym, spot, current_vix, vix_history_window, balance, today, params)
                         if sigs:
                             candidates.extend(sigs)
