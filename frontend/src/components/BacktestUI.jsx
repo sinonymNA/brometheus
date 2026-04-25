@@ -444,7 +444,7 @@ export default function BacktestUI({ get, post }) {
     walk_forward: false,
   })
   const [symbols, setSymbols] = useState('SPY,QQQ,AAPL,NVDA,MSFT')
-  const [strategies, setStrategies] = useState({ momentum: true, iv_rank: true, flow: true })
+  const [strategies, setStrategies] = useState({ momentum: true, iv_rank: true, flow: true, ma_cross: true })
   const [jobId, setJobId] = useState(null)
   const [jobStatus, setJobStatus] = useState(null)
   const pollRef = useRef(null)

@@ -30,18 +30,18 @@ class BacktestParams:
 
     All values are per-run only — they never touch live-bot constants.
     """
-    rsi_bull_threshold: float = 57.0    # RSI above this → bull momentum trigger
-    rsi_bear_threshold: float = 43.0    # RSI below this → bear momentum trigger
-    volume_ratio_min: float = 1.15      # call/put volume ratio min for flow strategy
-    iv_rank_max: float = 65.0           # momentum: skip when IV rank % exceeds this (longs get vol-crushed)
-    iv_rank_min: float = 55.0           # iv_rank strategy: trigger above this %
-    signal_strength_min: float = 0.10   # discard signals below this
-    stop_loss_pct: float = 0.35         # long: exit when premium loses this fraction (35 %)
-    profit_target_pct: float = 0.65     # long: exit when gain reaches this fraction (65 %) — ~1.85:1 R:R
-    min_dte: int = 5                    # close position when DTE ≤ this
-    max_dte: int = 45                   # only enter options with ≤ this DTE
-    max_positions: int = 8              # max concurrent open positions
-    position_size_pct: float = 0.025    # max portfolio fraction risked per trade
+    rsi_bull_threshold: float = 55.0    # RSI above this → bull momentum trigger
+    rsi_bear_threshold: float = 45.0    # RSI below this → bear momentum trigger
+    volume_ratio_min: float = 1.0       # call/put volume ratio min for flow strategy
+    iv_rank_max: float = 70.0           # momentum: skip when IV rank % exceeds this (longs get vol-crushed)
+    iv_rank_min: float = 40.0           # iv_rank strategy: trigger above this %
+    signal_strength_min: float = 0.05   # discard signals below this
+    stop_loss_pct: float = 0.30         # long: exit when premium loses this fraction (30 %)
+    profit_target_pct: float = 0.50     # long: exit when gain reaches this fraction (50 %) — ~1.67:1 R:R, fast turnover
+    min_dte: int = 3                    # close position when DTE ≤ this (more aggressive expiry closing)
+    max_dte: int = 21                   # only enter options with ≤ this DTE (shorter-dated, more gamma)
+    max_positions: int = 12             # max concurrent open positions
+    position_size_pct: float = 0.035    # max portfolio fraction risked per trade (aggressive sizing)
 
     @classmethod
     def from_dict(cls, d: dict) -> "BacktestParams":
@@ -259,8 +259,8 @@ def _eval_momentum(
     if rsi is None:
         return None
 
-    # Skip when market is in extreme stress — above VIX 35 directional signals become unreliable
-    if current_vix is not None and current_vix > 35.0:
+    # Skip only in panic conditions (VIX > 40) — trade in all other conditions
+    if current_vix is not None and current_vix > 40.0:
         return None
 
     if iv_rank is not None and iv_rank > params.iv_rank_max:
@@ -434,6 +434,69 @@ def _eval_flow(
     return signals if signals else None
 
 
+def _eval_ma_crossover(
+    symbol: str,
+    closes: list[float],
+    spot: float,
+    sigma: float,
+    balance: float,
+    today: date,
+    params: BacktestParams,
+) -> list[dict] | None:
+    """Mean reversion on MA crossover: SMA10 crosses SMA20."""
+    if len(closes) < 21:
+        return None
+
+    sma10 = _compute_sma(closes, 10)
+    sma20 = _compute_sma(closes, 20)
+
+    if sma10 is None or sma20 is None or len(closes) < 22:
+        return None
+
+    # Previous bar values for crossover detection
+    prev_sma10 = _compute_sma(closes[:-1], 10)
+    prev_sma20 = _compute_sma(closes[:-1], 20)
+
+    if prev_sma10 is None or prev_sma20 is None:
+        return None
+
+    # Bullish crossover: SMA10 crosses above SMA20
+    bull_cross = (prev_sma10 <= prev_sma20) and (sma10 > sma20)
+    # Bearish crossover: SMA10 crosses below SMA20
+    bear_cross = (prev_sma10 >= prev_sma20) and (sma10 < sma20)
+
+    if not (bull_cross or bear_cross):
+        return None
+
+    target_dte = min(7, params.max_dte)  # Very short dated for gamma
+    expiry = _next_expiry(today, target_dte)
+    dte = (expiry - today).days
+
+    if bull_cross:
+        strike = round(spot * 1.00, 0)  # ATM
+        price = _option_price(spot, strike, dte, sigma, "call")
+        if price >= 0.10:
+            strength = min(abs(sma10 - sma20) / spot, 1.0)  # Strength from MA distance
+            return [{
+                "symbol": symbol, "strategy": "ma_cross", "signal_type": "ma_bull_cross",
+                "action": "buy", "option_type": "call", "strike": strike,
+                "expiry": expiry, "price": price, "strength": round(max(0.2, strength), 4),
+            }]
+
+    # Bear cross
+    strike = round(spot * 1.00, 0)  # ATM
+    price = _option_price(spot, strike, dte, sigma, "put")
+    if price >= 0.10:
+        strength = min(abs(sma10 - sma20) / spot, 1.0)
+        return [{
+            "symbol": symbol, "strategy": "ma_cross", "signal_type": "ma_bear_cross",
+            "action": "buy", "option_type": "put", "strike": strike,
+            "expiry": expiry, "price": price, "strength": round(max(0.2, strength), 4),
+        }]
+
+    return None
+
+
 def _check_exit(
     trade: _BacktestTrade,
     spot: float,
@@ -505,7 +568,7 @@ class BacktestEngine:
     ) -> None:
         self._loader = loader
         self._symbols = symbols
-        self._strategies = strategies or ["momentum", "iv_rank", "flow"]
+        self._strategies = strategies or ["momentum", "iv_rank", "flow", "ma_cross"]
 
     async def run(
         self,
@@ -662,6 +725,10 @@ class BacktestEngine:
                             candidates.extend(sigs)
                     if "flow" in self._strategies:
                         sigs = _eval_flow(sym, spot, sigma, chain, balance, today, params)
+                        if sigs:
+                            candidates.extend(sigs)
+                    if "ma_cross" in self._strategies:
+                        sigs = _eval_ma_crossover(sym, sym_closes, spot, sigma, balance, today, params)
                         if sigs:
                             candidates.extend(sigs)
 
