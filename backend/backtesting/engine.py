@@ -30,17 +30,17 @@ class BacktestParams:
 
     All values are per-run only — they never touch live-bot constants.
     """
-    rsi_bull_threshold: float = 62.0    # RSI above this → overbought
-    rsi_bear_threshold: float = 38.0    # RSI below this → oversold
+    rsi_bull_threshold: float = 62.0    # RSI above this → bull momentum trigger
+    rsi_bear_threshold: float = 38.0    # RSI below this → bear momentum trigger
     volume_ratio_min: float = 1.5       # call/put volume ratio min for flow strategy
-    iv_rank_max: float = 60.0           # momentum: skip when IV rank % exceeds this
+    iv_rank_max: float = 60.0           # momentum: skip when IV rank % exceeds this (longs get vol-crushed)
     iv_rank_min: float = 70.0           # iv_rank strategy: trigger above this %
-    signal_strength_min: float = 0.55   # discard signals below this
-    stop_loss_pct: float = 0.08         # long: exit when premium loses this fraction
-    profit_target_pct: float = 0.30     # exit when gain reaches this fraction
+    signal_strength_min: float = 0.25   # discard signals below this
+    stop_loss_pct: float = 0.40         # long: exit when premium loses this fraction (40 %)
+    profit_target_pct: float = 1.00     # long: exit when gain reaches this fraction (100 % = double)
     min_dte: int = 5                    # close position when DTE ≤ this
     max_dte: int = 45                   # only enter options with ≤ this DTE
-    max_positions: int = 3              # max concurrent open positions
+    max_positions: int = 5              # max concurrent open positions
     position_size_pct: float = 0.02     # max portfolio fraction risked per trade
 
     @classmethod
@@ -241,73 +241,77 @@ def _eval_momentum(
     spy_ma20: float | None = None,
     iv_rank: float | None = None,
 ) -> list[dict] | None:
-    """RSI-based signals with SPY 20d MA market-regime filter.
+    """Buy calls/puts on RSI + price breakout momentum, with SPY 20d MA trend filter.
 
-    Bull regime (SPY > 20d MA): calls only.
-    Bear regime (SPY < 20d MA): puts only.
-    Skips when IV rank exceeds params.iv_rank_max (vol crush risk).
+    Bull: RSI > threshold AND spot > 10-day high → buy call.
+    Bear: RSI < threshold AND spot < 10-day low  → buy put.
+    Trend filter blocks calls in bear regime and puts in bull regime.
+    Skips when IV rank exceeds params.iv_rank_max (vol crush risk on longs).
     """
+    if len(closes) < 25:
+        return None
+
     rsi = _compute_rsi(closes)
     if rsi is None:
         return None
 
-    # Skip momentum when implied vol is already expensive
     if iv_rank is not None and iv_rank > params.iv_rank_max:
         return None
 
-    # Determine regime: True=bull, False=bear, None=unknown
+    # Price breakout: compare today vs 10-bar high/low before today
+    window = closes[-11:-1]
+    if len(window) < 10:
+        return None
+    high_10 = max(window)
+    low_10  = min(window)
+
+    # Trend filter: True=bull, False=bear, None=no filter
     if spy_spot is not None and spy_ma20 is not None:
         bull_regime = spy_spot > spy_ma20
     else:
         bull_regime = None
 
+    bull = rsi >= params.rsi_bull_threshold and spot > high_10
+    bear = rsi <= params.rsi_bear_threshold and spot < low_10
+
+    # Block counter-trend trades
+    if bull_regime is False and bull:
+        bull = False
+    if bull_regime is True and bear:
+        bear = False
+
+    if not (bull or bear):
+        return None
+
     target_dte = min(21, params.max_dte)
     expiry = _next_expiry(today, target_dte)
     dte = (expiry - today).days
 
-    if rsi > params.rsi_bull_threshold:
-        strength = min((rsi - params.rsi_bull_threshold) / (100 - params.rsi_bull_threshold), 1.0)
-        if bull_regime is False:
-            strike = round(spot * 0.98, 0)
-            price = _option_price(spot, strike, dte, sigma, "put")
-            if price < 0.05:
-                return None
-            return [{"symbol": symbol, "strategy": "momentum",
-                     "signal_type": "overbought_sell_put", "action": "sell",
-                     "option_type": "put", "strike": strike,
-                     "expiry": expiry, "price": price, "strength": strength}]
-        else:
-            strike = round(spot * 1.02, 0)
-            price = _option_price(spot, strike, dte, sigma, "call")
-            if price < 0.05:
-                return None
-            return [{"symbol": symbol, "strategy": "momentum",
-                     "signal_type": "overbought_sell_call", "action": "sell",
-                     "option_type": "call", "strike": strike,
-                     "expiry": expiry, "price": price, "strength": strength}]
+    if bull:
+        rsi_excess   = (rsi - params.rsi_bull_threshold) / max(100.0 - params.rsi_bull_threshold, 1.0)
+        price_excess = min((spot / high_10 - 1.0) / 0.02, 1.0)   # 2 % above = full score
+        strength = round(max(0.10, min((rsi_excess + price_excess) / 2.0, 1.0)), 4)
+        strike = round(spot * 1.01, 0)   # ~1 % OTM call
+        price  = _option_price(spot, strike, dte, sigma, "call")
+        if price < 0.10:
+            return None
+        return [{"symbol": symbol, "strategy": "momentum",
+                 "signal_type": "momentum_bull", "action": "buy",
+                 "option_type": "call", "strike": strike,
+                 "expiry": expiry, "price": price, "strength": strength}]
 
-    if rsi < params.rsi_bear_threshold:
-        strength = min((params.rsi_bear_threshold - rsi) / params.rsi_bear_threshold, 1.0)
-        if bull_regime is False:
-            strike = round(spot * 0.98, 0)
-            price = _option_price(spot, strike, dte, sigma, "put")
-            if price < 0.05:
-                return None
-            return [{"symbol": symbol, "strategy": "momentum",
-                     "signal_type": "oversold_buy_put", "action": "buy",
-                     "option_type": "put", "strike": strike,
-                     "expiry": expiry, "price": price, "strength": strength}]
-        else:
-            strike = round(spot * 0.98, 0)
-            price = _option_price(spot, strike, dte, sigma, "call")
-            if price < 0.05:
-                return None
-            return [{"symbol": symbol, "strategy": "momentum",
-                     "signal_type": "oversold_buy_call", "action": "buy",
-                     "option_type": "call", "strike": strike,
-                     "expiry": expiry, "price": price, "strength": strength}]
-
-    return None
+    # bear
+    rsi_excess   = (params.rsi_bear_threshold - rsi) / max(params.rsi_bear_threshold, 1.0)
+    price_excess = min((1.0 - spot / low_10) / 0.02, 1.0)         # 2 % below = full score
+    strength = round(max(0.10, min((rsi_excess + price_excess) / 2.0, 1.0)), 4)
+    strike = round(spot * 0.99, 0)   # ~1 % OTM put
+    price  = _option_price(spot, strike, dte, sigma, "put")
+    if price < 0.10:
+        return None
+    return [{"symbol": symbol, "strategy": "momentum",
+             "signal_type": "momentum_bear", "action": "buy",
+             "option_type": "put", "strike": strike,
+             "expiry": expiry, "price": price, "strength": strength}]
 
 
 def _eval_iv_rank(
@@ -334,11 +338,11 @@ def _eval_iv_rank(
     expiry = _next_expiry(today, target_dte)
     dte = (expiry - today).days
 
-    # Short call spread: sell ATM call, buy OTM call
-    short_call_k = round(spot * 1.005, 0)
-    long_call_k = round(spot * 1.05, 0)
-    short_put_k = round(spot * 0.995, 0)
-    long_put_k = round(spot * 0.95, 0)
+    # Iron condor: short strikes 5 % OTM, long strikes 10 % OTM (matches live iv_rank strategy)
+    short_call_k = round(spot * 1.05, 0)
+    long_call_k  = round(spot * 1.10, 0)
+    short_put_k  = round(spot * 0.95, 0)
+    long_put_k   = round(spot * 0.90, 0)
 
     sc = _option_price(spot, short_call_k, dte, sigma, "call")
     lc = _option_price(spot, long_call_k, dte, sigma, "call")
@@ -371,31 +375,46 @@ def _eval_flow(
     today: date,
     params: BacktestParams,
 ) -> list[dict] | None:
-    """Simulated unusual flow: call/put volume ratio above params.volume_ratio_min → buy call."""
+    """Simulated unusual flow: call-heavy → buy call; put-heavy → buy put."""
     if not chain:
         return None
     call_vol = sum(c["volume"] for c in chain if c["option_type"] == "call")
-    put_vol = sum(c["volume"] for c in chain if c["option_type"] == "put")
-    if put_vol == 0:
-        return None
-    ratio = call_vol / put_vol
-    if ratio < params.volume_ratio_min:
+    put_vol  = sum(c["volume"] for c in chain if c["option_type"] == "put")
+    if call_vol == 0 and put_vol == 0:
         return None
 
     target_dte = min(14, params.max_dte)
     expiry = _next_expiry(today, target_dte)
     dte = (expiry - today).days
-    strike = round(spot * 1.01, 0)
-    price = _option_price(spot, strike, dte, sigma, "call")
-    if price < 0.05:
-        return None
+    signals: list[dict] = []
 
-    strength = min((ratio - 1.5) / 1.5, 1.0)
-    return [{
-        "symbol": symbol, "strategy": "flow", "signal_type": "unusual_call_flow",
-        "action": "buy", "option_type": "call", "strike": strike,
-        "expiry": expiry, "price": price, "strength": strength,
-    }]
+    # Bullish flow
+    if put_vol > 0 and call_vol / put_vol >= params.volume_ratio_min:
+        strike = round(spot * 1.01, 0)
+        price  = _option_price(spot, strike, dte, sigma, "call")
+        if price >= 0.10:
+            ratio    = call_vol / put_vol
+            strength = max(0.10, min((ratio - params.volume_ratio_min) / max(params.volume_ratio_min, 0.01), 1.0))
+            signals.append({
+                "symbol": symbol, "strategy": "flow", "signal_type": "unusual_call_flow",
+                "action": "buy", "option_type": "call", "strike": strike,
+                "expiry": expiry, "price": price, "strength": round(strength, 4),
+            })
+
+    # Bearish flow
+    if call_vol > 0 and put_vol / call_vol >= params.volume_ratio_min:
+        strike = round(spot * 0.99, 0)
+        price  = _option_price(spot, strike, dte, sigma, "put")
+        if price >= 0.10:
+            ratio    = put_vol / call_vol
+            strength = max(0.10, min((ratio - params.volume_ratio_min) / max(params.volume_ratio_min, 0.01), 1.0))
+            signals.append({
+                "symbol": symbol, "strategy": "flow", "signal_type": "unusual_put_flow",
+                "action": "buy", "option_type": "put", "strike": strike,
+                "expiry": expiry, "price": price, "strength": round(strength, 4),
+            })
+
+    return signals if signals else None
 
 
 def _check_exit(
@@ -421,15 +440,16 @@ def _check_exit(
     entry_value = trade.entry_price * 100 * trade.quantity
 
     if trade.action == "sell":
-        # Profit target: collect params.profit_target_pct of credit
-        if pnl >= entry_value * params.profit_target_pct:
+        # Short premium (condors, credit spreads): industry-standard exits.
+        # Close at 50 % of credit; stop when credit doubles against you (200 %).
+        if pnl >= entry_value * 0.50:
             return True, "profit_target", ep
-        # Stop: short options stop at 10× the buy stop (credit spread convention)
-        if pnl <= -entry_value * (params.stop_loss_pct * 10):
+        if pnl <= -entry_value * 2.0:
             return True, "stop_loss", ep
     else:
-        # Profit target: long options — 2.5× of profit_target_pct for higher upside
-        if pnl >= entry_value * (params.profit_target_pct * 2.5):
+        # Long directional options: target = params.profit_target_pct of premium;
+        # stop = params.stop_loss_pct of premium.
+        if pnl >= entry_value * params.profit_target_pct:
             return True, "profit_target", ep
         if pnl <= -entry_value * params.stop_loss_pct:
             return True, "stop_loss", ep
@@ -632,16 +652,21 @@ class BacktestEngine:
                         qty = _kelly_contracts(
                             balance,
                             win_rate=0.55,
-                            avg_win=200.0,
-                            avg_loss=120.0,
+                            avg_win=400.0,
+                            avg_loss=250.0,
                             strength=sig["strength"],
                             option_price=sig["price"],
                             params=params,
                             recent_trades=closed_trades,
                         )
-                        cost = sig["price"] * 100 * qty
+                        # Simulate bid-ask spread: buys fill at ask (~1 % above mid),
+                        # sells fill at bid (~1 % below mid).
+                        raw_price = sig["price"]
+                        entry_price = raw_price * (1.01 if sig["action"] == "buy" else 0.99)
+
+                        cost = entry_price * 100 * qty
                         if sig["action"] == "buy" and cost > balance * params.position_size_pct * 2:
-                            qty = max(1, int(balance * params.position_size_pct / (sig["price"] * 100)))
+                            qty = max(1, int(balance * params.position_size_pct / (entry_price * 100)))
 
                         trade = _BacktestTrade(
                             id=uuid.uuid4().hex,
@@ -653,7 +678,7 @@ class BacktestEngine:
                             strike=sig.get("strike", 0.0),
                             expiry=sig["expiry"],
                             quantity=qty,
-                            entry_price=sig["price"],
+                            entry_price=entry_price,
                             entry_time=datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc),
                             legs=sig.get("legs"),
                         )
