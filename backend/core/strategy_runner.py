@@ -1,6 +1,6 @@
 """Strategy orchestration loop for APEX CRUSHER.
 
-Runs all three trading strategies every 60 seconds during market hours,
+Runs all four trading strategies every 60 seconds during market hours,
 deduplicates and prioritises signals, executes approved trades, and monitors
 open positions.
 
@@ -26,6 +26,7 @@ from backend.core.risk_manager import RiskManager
 from backend.data.alpaca_client import AlpacaClient
 from backend.strategies.flow import FlowStrategy
 from backend.strategies.iv_rank import IVRankStrategy
+from backend.strategies.ma_cross import MACrossStrategy
 from backend.strategies.momentum import MomentumStrategy
 from backend.utils.logger import get_logger
 
@@ -49,6 +50,7 @@ class StrategyRunner:
         )
         self._momentum = MomentumStrategy(alpaca_client, storage)
         self._iv_rank  = IVRankStrategy(alpaca_client, storage)
+        self._ma_cross = MACrossStrategy(alpaca_client, storage)
         self._flow     = FlowStrategy(alpaca_client, storage)
 
         self._task: asyncio.Task[None] | None = None
@@ -95,7 +97,7 @@ class StrategyRunner:
         Steps:
 
         1. Skip if market is closed.
-        2. Run all three strategy scans concurrently.
+        2. Run all four strategy scans concurrently.
         3. Flatten, sort by strength descending, deduplicate by symbol.
         4. Save each signal to DB, then execute it.
         5. Monitor all open trades for exit conditions.
@@ -109,6 +111,7 @@ class StrategyRunner:
         scan_results = await asyncio.gather(
             self._momentum.scan(),
             self._iv_rank.scan(),
+            self._ma_cross.scan(),
             self._flow.scan(),
             return_exceptions=True,
         )
@@ -116,13 +119,13 @@ class StrategyRunner:
         signals: list[dict[str, Any]] = []
         for i, result in enumerate(scan_results):
             if isinstance(result, Exception):
-                names = ("momentum", "iv_rank", "flow")
+                names = ("momentum", "iv_rank", "ma_cross", "flow")
                 logger.error("Strategy %s scan error: %s", names[i], result)
             elif isinstance(result, list):
                 signals.extend(result)
 
         # Collect near-misses from each strategy
-        for strat in (self._momentum, self._iv_rank, self._flow):
+        for strat in (self._momentum, self._iv_rank, self._ma_cross, self._flow):
             nm_list = list(getattr(strat, "near_misses", None) or [])
             for item in reversed(nm_list):
                 self.near_misses.appendleft(item)

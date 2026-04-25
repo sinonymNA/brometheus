@@ -27,7 +27,7 @@ logger = get_logger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MAX_RISK_PER_TRADE_PCT: float = 0.02  # never risk more than 2 % of equity
+MAX_RISK_PER_TRADE_PCT: float = 0.003  # risk exactly 0.3 % per trade = $150 on $50k
 MAX_CONTRACTS: int = 10               # hard cap regardless of Kelly output
 
 # Defaults used when fewer than 10 closed trades exist in the database.
